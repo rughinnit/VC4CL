@@ -34,6 +34,8 @@ namespace vc4cl
 
     enum class ExecutionMode : uint8_t
     {
+        // no kernel execution backend available, attempts to execute a kernel fail with an OpenCL error
+        NONE,
         MAILBOX_IOCTL,
         V3D_REGISTER_POKING,
         VCHI_GPU_SERVICE

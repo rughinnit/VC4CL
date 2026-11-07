@@ -58,6 +58,8 @@ static std::string toString(ExecutionMode mode)
 {
     switch(mode)
     {
+    case ExecutionMode::NONE:
+        return "none";
     case ExecutionMode::MAILBOX_IOCTL:
         return "mailbox";
     case ExecutionMode::V3D_REGISTER_POKING:

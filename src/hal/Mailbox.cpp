@@ -107,7 +107,21 @@ std::unique_ptr<DeviceBuffer> Mailbox::allocateBuffer(
     if(handle != 0)
     {
         DevicePointer qpuPointer = memLock(handle);
-        void* hostPointer = mapmem(V3D::busAddressToPhysicalAddress(static_cast<unsigned>(qpuPointer)), sizeInBytes);
+        void* hostPointer = nullptr;
+        try
+        {
+            hostPointer = mapmem(V3D::busAddressToPhysicalAddress(static_cast<unsigned>(qpuPointer)), sizeInBytes);
+        }
+        catch(const std::system_error& err)
+        {
+            // e.g. non-root users cannot access /dev/mem to map the buffer allocated via the mailbox, so report the
+            // allocation as failed instead of terminating the process
+            DEBUG_LOG(DebugLevel::MEMORY,
+                std::cout << "Failed to map allocated buffer: " << err.what() << std::endl)
+            ignoreReturnValue(memUnlock(handle), __FILE__, __LINE__, "Cleaning up after failed mapping");
+            ignoreReturnValue(memFree(handle), __FILE__, __LINE__, "Cleaning up after failed mapping");
+            return nullptr;
+        }
         DEBUG_LOG(DebugLevel::MEMORY,
             std::cout << "Allocated " << sizeInBytes << " bytes of buffer: handle " << handle << ", device address "
                       << std::hex << "0x" << qpuPointer << ", host address " << hostPointer << std::dec << std::endl)
