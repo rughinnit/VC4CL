@@ -8,6 +8,7 @@
 
 #include "hal.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,11 @@ static constexpr uint32_t V3D_SRQPC = 0x00430 / sizeof(uint32_t);
 static constexpr uint32_t V3D_SRQUA = 0x00434 / sizeof(uint32_t);
 static constexpr uint32_t V3D_SRQCS = 0x0043c / sizeof(uint32_t);
 static constexpr uint32_t V3D_VPMBASE = 0x00504 / sizeof(uint32_t);
+// The vc4 DRM driver writes V3D_VPMBASE = 0 on probe and on every runtime-PM resume, so the reservation has to be
+// re-armed before user programs are queued. Bits 4:0 hold the VPM memory reserved for user programs in 256-byte
+// units. HW-2253 limits user programs to the first 64 VPM rows, i.e. 64 * 16 * sizeof(uint32_t) = 4 KB = 16 units.
+static constexpr uint32_t VPM_USER_WINDOW_SIZE = 64 * 16 * sizeof(uint32_t);
+static constexpr uint32_t VPM_RESERVATION_UNIT = 256;
 static constexpr uint32_t V3D_COUNTER_CLEAR = 0x0670 / sizeof(uint32_t);
 static constexpr uint32_t V3D_COUNTER_ENABLE = 0x0674 / sizeof(uint32_t);
 static constexpr uint32_t V3D_COUNTER_VALUE_BASE = 0x0680 / sizeof(uint32_t);
@@ -240,6 +246,11 @@ bool V3D::hasError(const ErrorType type) const
 ExecutionHandle V3D::executeQPU(
     unsigned numQPUs, std::pair<uint32_t*, unsigned> addressPairs, bool flushBuffer, std::chrono::milliseconds timeout)
 {
+    // The vc4 driver zeroes V3D_VPMBASE on probe and on every runtime-PM resume, while VC4CL runs its kernels as SRQ
+    // user programs that rely on this reservation. Re-arm it before queueing. HW-2253 caps the window at 4 KB (16 units).
+    if((v3dBasePointer[V3D_VPMBASE] & 0x1F) != (VPM_USER_WINDOW_SIZE / VPM_RESERVATION_UNIT))
+        v3dBasePointer[V3D_VPMBASE] = VPM_USER_WINDOW_SIZE / VPM_RESERVATION_UNIT;
+
     // see
     // https://github.com/raspberrypi/userland/blob/master/host_applications/linux/apps/hello_pi/hello_fft/gpu_fft_base.c,
     // function gpu_fft_base_exec_direct
@@ -308,7 +319,8 @@ bool V3D::readValue(SystemQuery query, uint32_t& output) noexcept
         output = getSystemInfo(SystemInfo::QPU_COUNT);
         return true;
     case SystemQuery::TOTAL_VPM_MEMORY_IN_BYTES:
-        output = getSystemInfo(SystemInfo::VPM_MEMORY_SIZE);
+        // Only the first 64 VPM rows are usable by user programs (HW-2253), so report the user-visible window
+        output = std::min(getSystemInfo(SystemInfo::VPM_MEMORY_SIZE), VPM_USER_WINDOW_SIZE);
         return true;
     }
     return false;
