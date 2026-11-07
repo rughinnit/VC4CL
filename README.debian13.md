@@ -318,3 +318,22 @@ small to amortize the submission overhead.
 
 The library and build files are unchanged by this workstream; the patches in
 `src/hal/` are owned by the source workstream.
+
+## VPMBASE fix (2026-11-08)
+
+The vc4 DRM driver writes `V3D_VPMBASE = 0` at probe and on every runtime-PM
+resume, which reserves no VPM for user (SRQ) programs. VC4CL now re-arms
+`VPMBASE` to 16 units (16 * 256 = 4096 bytes, the HW-2253 user window) at the
+top of `V3D::executeQPU`, before every launch.
+
+Validated on a clean boot with `bench_vc4cl all`:
+
+- `VPMBASE & 0x1F == 16` after every launch
+- `ERRSTAT & 0x30 == 0` after the full matrix (the VPM write/read range errors
+  are gone; `0x1000` is the normal VCD-idle bit)
+- No `VPM_ALLOCATING_WHILE_BUSY`
+
+This fixes the VPM range errors but does **not** fix the deterministic
+lane-scoped mismatch (global IDs congruent to 1 mod 4) seen for vector 65536,
+vector 1048576 and matmul 64. That remaining defect points at per-lane
+uniform/QPU code generation or cache handling, not VPM sizing.
