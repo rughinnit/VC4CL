@@ -12,6 +12,7 @@
 #ifndef NO_VCSM
 #include "VCSM.h"
 #endif
+#include "device_memory.h"
 #include "emulator.h"
 #include "userland.h"
 
@@ -343,9 +344,26 @@ bool SystemAccess::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers
         return vcsm->flushCPUCache(buffers);
     #endif
     if(mailbox && memoryManagement == MemoryManagement::MAILBOX)
-        // Mailbox-allocated buffers are mapped with MemoryFlag::DIRECT, i.e. uncached, so no dirty CPU cache lines
-        // can exist and there is no cache maintenance to perform
+    {
+        /*
+         * Mailbox buffers are allocated through the VideoCore mailbox and mapped into the host address space via
+         * /dev/mem. The QPU does not snoop the ARM data caches, and neither the mapping attributes nor the mailbox
+         * allocation are guaranteed to keep the ARM caches coherent with the GPU:
+         *
+         * - host writes can still leave dirty cache lines behind, which the GPU never sees, so it reads the previous
+         *   content of the pages (deterministic when a later workload or process reuses mailbox pages), and
+         * - GPU writes can be shadowed by stale ARM cache lines when the host reads the results back.
+         *
+         * The V3D L2/SLC are cleared before QPU execution (L2CACTL=0x1, SLCACTL=0), so only the ARM side needs
+         * maintenance here: clean+invalidate every host-mapped buffer before the QPU runs.
+         */
+        for(const auto* buffer : buffers)
+        {
+            if(buffer != nullptr && buffer->hostPointer != nullptr && buffer->size != 0)
+                cleanInvalidateDataCache(buffer->hostPointer, buffer->size);
+        }
         return true;
+    }
     return false;
 }
 

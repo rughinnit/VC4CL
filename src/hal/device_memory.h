@@ -55,10 +55,87 @@ namespace vc4cl
     } // namespace detail
 
     /*
+     * ARM (host) cache maintenance for device memory shared with the GPU.
+     *
+     * The QPU does not snoop the ARM data caches. Host writes to a device buffer can therefore stay dirty in the ARM
+     * caches and be invisible to the GPU, while GPU writes can be hidden by stale ARM cache lines when the host reads
+     * the buffer back. Both operations below are no-ops on non-aarch64 hosts.
+     */
+
+    constexpr std::size_t ARM_CACHE_LINE_SIZE = 64;
+
+    /*
+     * Cleans (writes back) and invalidates the ARM data cache lines covering [addr, addr + bytes).
+     *
+     * Used after the host wrote into device memory, so that the GPU observes the new content and the host does not
+     * later read back stale data from its own cache.
+     */
+    inline void cleanInvalidateDataCache(void* addr, std::size_t bytes) noexcept
+    {
+#if defined(__aarch64__)
+        if(addr == nullptr || bytes == 0)
+            return;
+        auto line = reinterpret_cast<std::uintptr_t>(addr) & ~static_cast<std::uintptr_t>(ARM_CACHE_LINE_SIZE - 1);
+        const auto end = reinterpret_cast<std::uintptr_t>(addr) + bytes;
+        for(; line < end; line += ARM_CACHE_LINE_SIZE)
+            asm volatile("dc civac, %0" : : "r"(line) : "memory");
+        asm volatile("dsb sy" : : : "memory");
+#else
+        (void)addr;
+        (void)bytes;
+#endif
+    }
+
+    /*
+     * Invalidates the ARM data cache lines covering [addr, addr + bytes) without writing them back.
+     *
+     * Used before the host reads device memory the GPU wrote into, so that stale host cache lines cannot shadow the
+     * GPU results.
+     *
+     * NOTE: Linux/arm64 does not let user space execute "dc ivac". The kernel runs EL0 with SCTLR_EL1.UCI == 0 and
+     * emulates only DC CVAC, DC CIVAC, DC CVAU and IC IVAU in do_user_cache_maint(); every other cache maintenance
+     * instruction is turned into SIGILL (verified on this target with kernel 6.18). Therefore the default
+     * implementation falls back to the strongest operation that is actually available at EL0, DC CIVAC:
+     *
+     * - Mailbox buffers are mapped through /dev/mem with O_SYNC, i.e. as Normal Non-cacheable, so no host cache line
+     *   for them exists and there is nothing to write back; the operation reduces to the DSB ordering barrier.
+     * - For a cacheable mapping, cleaning would write stale host lines back over the GPU results, which is why the
+     *   non-cacheable mailbox mapping is required for this fallback to be safe.
+     *
+     * Set VC4CL_EL0_DC_IVAC to 1 only when the target kernel really supports EL0 DC IVAC.
+     */
+#ifndef VC4CL_EL0_DC_IVAC
+#define VC4CL_EL0_DC_IVAC 0
+#endif
+
+    inline void invalidateDataCache(void* addr, std::size_t bytes) noexcept
+    {
+#if defined(__aarch64__)
+        if(addr == nullptr || bytes == 0)
+            return;
+        auto line = reinterpret_cast<std::uintptr_t>(addr) & ~static_cast<std::uintptr_t>(ARM_CACHE_LINE_SIZE - 1);
+        const auto end = reinterpret_cast<std::uintptr_t>(addr) + bytes;
+#if VC4CL_EL0_DC_IVAC
+        for(; line < end; line += ARM_CACHE_LINE_SIZE)
+            asm volatile("dc ivac, %0" : : "r"(line) : "memory");
+#else
+        for(; line < end; line += ARM_CACHE_LINE_SIZE)
+            asm volatile("dc civac, %0" : : "r"(line) : "memory");
+#endif
+        asm volatile("dsb sy" : : : "memory");
+#else
+        (void)addr;
+        (void)bytes;
+#endif
+    }
+
+    /*
      * Copies from normal host memory into device memory.
      */
     inline void deviceMemcpy(void* dst, const void* src, std::size_t bytes)
     {
+        if(dst == nullptr || src == nullptr || bytes == 0)
+            return;
         auto* dstBytes = static_cast<unsigned char*>(dst);
         const auto* srcBytes = static_cast<const unsigned char*>(src);
         std::size_t i = 0;
@@ -78,6 +155,9 @@ namespace vc4cl
         // unaligned tail: byte accesses only
         for(; i < bytes; ++i)
             detail::writeVolatileByte(dstBytes + i, srcBytes[i]);
+
+        // the GPU does not snoop the ARM caches, make the host writes visible to the QPU
+        cleanInvalidateDataCache(dst, bytes);
     }
 
     /*
@@ -85,6 +165,12 @@ namespace vc4cl
      */
     inline void deviceMemcpyToHost(void* dst, const void* deviceSrc, std::size_t bytes)
     {
+        if(dst == nullptr || deviceSrc == nullptr || bytes == 0)
+            return;
+
+        // drop stale host cache lines first, the GPU does not snoop the ARM caches
+        invalidateDataCache(const_cast<void*>(deviceSrc), bytes);
+
         auto* dstBytes = static_cast<unsigned char*>(dst);
         const auto* srcBytes = static_cast<const unsigned char*>(deviceSrc);
         std::size_t i = 0;
@@ -135,6 +221,8 @@ namespace vc4cl
      */
     inline void deviceMemset(void* dst, int value, std::size_t bytes)
     {
+        if(dst == nullptr || bytes == 0)
+            return;
         auto* dstBytes = static_cast<unsigned char*>(dst);
         const auto byteValue = static_cast<unsigned char>(value);
         std::size_t i = 0;
@@ -151,6 +239,9 @@ namespace vc4cl
         // unaligned tail: byte accesses only
         for(; i < bytes; ++i)
             detail::writeVolatileByte(dstBytes + i, byteValue);
+
+        // the GPU does not snoop the ARM caches, make the host writes visible to the QPU
+        cleanInvalidateDataCache(dst, bytes);
     }
 } // namespace vc4cl
 
