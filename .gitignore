@@ -1,6 +1,9 @@
 # Default Build folder
 build/
 
+# Build folder for the ICD-enabled library
+build-icd/
+
 #Eclipse
 .cproject
 .project

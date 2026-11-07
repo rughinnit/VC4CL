@@ -7,9 +7,9 @@
 #include "V3D.h"
 
 #include "hal.h"
-#include "userland.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
 #include <iostream>
@@ -43,16 +43,69 @@ static constexpr uint32_t V3D_ERRORS = 0x0F20 / sizeof(uint32_t);
 static constexpr uint32_t V3D_COUNTER_INCREMENT = 0x0008 / sizeof(uint32_t);
 static constexpr uint32_t V3D_LENGTH = ((V3D_ERRORS - V3D_IDENT0) + 16) * sizeof(uint32_t);
 
+// peripheral base address of the BCM2835/BCM2836/BCM2837 SoCs used by the Raspberry Pi 1, 2 and 3
+static constexpr uint32_t DEFAULT_PERIPHERAL_BASE = 0x3F000000;
+
+/**
+ * Determines the base address of the SoC peripherals without using libbcm_host.
+ *
+ * The "ranges" property of the "soc" device-tree node contains a list of (child address, parent address, size) triples
+ * of big-endian 32-bit cells. The first triple maps the peripherals into the ARM physical address space, so the second
+ * cell of the property is the peripheral base address. bcm_host_get_peripheral_address() parses the same property.
+ * If the property cannot be read (or contains implausible data), fall back to the address used by BCM283x.
+ */
+static uint32_t getPeripheralBaseAddress()
+{
+    static const char* rangesPath = "/proc/device-tree/soc/ranges";
+    const int fd = open(rangesPath, O_RDONLY);
+    if(fd < 0)
+    {
+        DEBUG_LOG(DebugLevel::SYSCALL,
+            std::cout << "[VC4CL] Could not open " << rangesPath << ", assuming peripheral base 0x" << std::hex
+                      << DEFAULT_PERIPHERAL_BASE << std::dec << std::endl)
+        return DEFAULT_PERIPHERAL_BASE;
+    }
+
+    // only the first triple is of interest: child address, parent (peripheral) address, size
+    uint8_t cells[3 * sizeof(uint32_t)] = {};
+    const auto bytesRead = read(fd, cells, sizeof(cells));
+    close(fd);
+    if(bytesRead != static_cast<ssize_t>(sizeof(cells)))
+    {
+        DEBUG_LOG(DebugLevel::SYSCALL,
+            std::cout << "[VC4CL] Could not read " << rangesPath << ", assuming peripheral base 0x" << std::hex
+                      << DEFAULT_PERIPHERAL_BASE << std::dec << std::endl)
+        return DEFAULT_PERIPHERAL_BASE;
+    }
+
+    // the cells are stored in big-endian byte order, the peripheral base is the second cell
+    const uint32_t peripheralBase = (static_cast<uint32_t>(cells[4]) << 24) |
+        (static_cast<uint32_t>(cells[5]) << 16) | (static_cast<uint32_t>(cells[6]) << 8) |
+        static_cast<uint32_t>(cells[7]);
+    if(peripheralBase == 0 || peripheralBase == 0xFFFFFFFF)
+    {
+        DEBUG_LOG(DebugLevel::SYSCALL,
+            std::cout << "[VC4CL] Implausible peripheral base 0x" << std::hex << peripheralBase
+                      << " from device-tree, assuming 0x" << DEFAULT_PERIPHERAL_BASE << std::dec << std::endl)
+        return DEFAULT_PERIPHERAL_BASE;
+    }
+
+    DEBUG_LOG(DebugLevel::SYSCALL,
+        std::cout << "[VC4CL] Peripheral base from device-tree: 0x" << std::hex << peripheralBase << std::dec
+                  << std::endl)
+    return peripheralBase;
+}
+
 V3D::V3D()
 {
     // NOTE: bcm_host_init() is intentionally not called here. The arm64 build of libbcm_host.so implements it by
     // opening /dev/vchiq (vchiq_initialise() + vchi_connect()), but its counterpart bcm_host_deinit() is a no-op in
     // that library, so the VCHIQ file descriptor is never closed. On process exit the kernel then blocks forever in
     // vchiq_release() -> wait_for_completion(), leaving the process unkillable in D state.
-    // bcm_host_get_peripheral_address() only parses /proc/device-tree/soc/ranges and does not touch VCHIQ, so it is
-    // safe (and sufficient) to use without bcm_host_init().
+    // The peripheral base address is read from the device-tree instead of via bcm_host_get_peripheral_address(), so
+    // this no longer depends on libbcm_host at all.
     v3dBasePointer = static_cast<uint32_t*>(
-        mapmem(busAddressToPhysicalAddress(bcm_host_get_peripheral_address() + V3D_BASE_OFFSET), V3D_LENGTH));
+        mapmem(busAddressToPhysicalAddress(getPeripheralBaseAddress() + V3D_BASE_OFFSET), V3D_LENGTH));
     DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] V3D base: " << v3dBasePointer << std::endl)
 }
 

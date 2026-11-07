@@ -47,7 +47,12 @@ static ExecutionMode getExecMode()
     // mailbox and VCHI GPU service execution do not require root rights
     // Due to https://github.com/raspberrypi/linux/issues/4321, do not use mailbox as default for anything
     // keep V3D as default for root for now to keep current behavior
-    return isRoot() ? ExecutionMode::V3D_REGISTER_POKING : ExecutionMode::VCHI_GPU_SERVICE;
+    // For non-root users there is no execution backend that can be enabled by default:
+    // - V3D register poking requires /dev/mem access (root)
+    // - VCHI requires /dev/vchiq and can block forever in vchiq_release() on process exit (D state), see
+    //   https://github.com/raspberrypi/linux/issues/4321 and the note in V3D.cpp
+    // So default to no execution backend and require an explicit opt-in, e.g. VC4CL_EXECUTE_MAILBOX=1.
+    return isRoot() ? ExecutionMode::V3D_REGISTER_POKING : ExecutionMode::NONE;
 }
 
 static MemoryManagement getMemoryMode()
@@ -173,6 +178,12 @@ SystemAccess::SystemAccess() :
         DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
             std::cout << "[VC4CL] Using VCHI for: "
                       << (executionMode == ExecutionMode::VCHI_GPU_SERVICE ? "kernel execution" : "") << std::endl)
+    if(executionMode == ExecutionMode::NONE)
+        // this is the default for non-root users, do not silently fall back to a backend that may hang on exit
+        DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
+            std::cout << "[VC4CL] No kernel execution backend available (set VC4CL_EXECUTE_MAILBOX=1 to execute "
+                         "kernels via the mailbox)"
+                      << std::endl)
 
     if(forcedCacheType.first)
     {
@@ -331,6 +342,10 @@ bool SystemAccess::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers
     if(vcsm && (memoryManagement == MemoryManagement::VCSM || memoryManagement == MemoryManagement::VCSM_CMA))
         return vcsm->flushCPUCache(buffers);
     #endif
+    if(mailbox && memoryManagement == MemoryManagement::MAILBOX)
+        // Mailbox-allocated buffers are mapped with MemoryFlag::DIRECT, i.e. uncached, so no dirty CPU cache lines
+        // can exist and there is no cache maintenance to perform
+        return true;
     return false;
 }
 
@@ -339,6 +354,9 @@ ExecutionHandle SystemAccess::executeQPU(unsigned numQPUs, std::pair<uint32_t*, 
 {
     if(isEmulated)
         return ExecutionHandle(emulateQPU(numQPUs, controlAddress.second, timeout));
+    if(executionMode == ExecutionMode::NONE)
+        // no execution backend selected, do not implicitly fall back to any backend (e.g. VCHI, which may hang)
+        return ExecutionHandle{false};
     if(vchi && executionMode == ExecutionMode::VCHI_GPU_SERVICE)
         return vchi->executeQPU(numQPUs, controlAddress, flushBuffer, timeout);
     if(mailbox && executionMode == ExecutionMode::MAILBOX_IOCTL)
