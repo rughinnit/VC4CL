@@ -45,7 +45,12 @@ static constexpr uint32_t V3D_LENGTH = ((V3D_ERRORS - V3D_IDENT0) + 16) * sizeof
 
 V3D::V3D()
 {
-    bcm_host_init();
+    // NOTE: bcm_host_init() is intentionally not called here. The arm64 build of libbcm_host.so implements it by
+    // opening /dev/vchiq (vchiq_initialise() + vchi_connect()), but its counterpart bcm_host_deinit() is a no-op in
+    // that library, so the VCHIQ file descriptor is never closed. On process exit the kernel then blocks forever in
+    // vchiq_release() -> wait_for_completion(), leaving the process unkillable in D state.
+    // bcm_host_get_peripheral_address() only parses /proc/device-tree/soc/ranges and does not touch VCHIQ, so it is
+    // safe (and sufficient) to use without bcm_host_init().
     v3dBasePointer = static_cast<uint32_t*>(
         mapmem(busAddressToPhysicalAddress(bcm_host_get_peripheral_address() + V3D_BASE_OFFSET), V3D_LENGTH));
     DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] V3D base: " << v3dBasePointer << std::endl)
@@ -53,8 +58,8 @@ V3D::V3D()
 
 V3D::~V3D()
 {
+    // No bcm_host_deinit() here, see the constructor comment above: it would not close the VCHIQ descriptor anyway.
     unmapmem(v3dBasePointer, V3D_LENGTH);
-    bcm_host_deinit();
 }
 
 uint32_t V3D::getSystemInfo(const SystemInfo key) const
