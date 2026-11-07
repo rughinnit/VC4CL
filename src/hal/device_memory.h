@@ -1,0 +1,157 @@
+/*
+ * Author: doe300
+ *
+ * See the file "LICENSE" for the full license governing this code.
+ */
+
+#ifndef VC4CL_DEVICE_MEMORY_H
+#define VC4CL_DEVICE_MEMORY_H
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+/*
+ * Helpers for accessing device memory that is mapped into the host address space (e.g. the mailbox memory mapped
+ * through /dev/mem).
+ *
+ * On arm64 such mappings usually carry "Device" memory attributes, which only allow naturally aligned accesses of the
+ * access size. The default glibc memcpy/memset implementations use 16-byte (and 8-byte) stores, so unaligned
+ * 16-byte stores to this memory raise SIGBUS.
+ *
+ * Therefore, all copies into or out of device memory are done with at most 32-bit accesses: 32-bit volatile word
+ * accesses for the aligned body and byte accesses for the unaligned head and tail. No 8-byte or 16-byte accesses are
+ * ever emitted for device memory.
+ */
+
+namespace vc4cl
+{
+    namespace detail
+    {
+        inline bool isAligned32(const void* ptr) noexcept
+        {
+            return (reinterpret_cast<std::uintptr_t>(ptr) & 3u) == 0;
+        }
+
+        inline unsigned char readVolatileByte(const void* ptr) noexcept
+        {
+            return *static_cast<const volatile unsigned char*>(ptr);
+        }
+
+        inline void writeVolatileByte(void* ptr, unsigned char value) noexcept
+        {
+            *static_cast<volatile unsigned char*>(ptr) = value;
+        }
+
+        inline std::uint32_t readVolatileWord(const void* ptr) noexcept
+        {
+            return *static_cast<const volatile std::uint32_t*>(ptr);
+        }
+
+        inline void writeVolatileWord(void* ptr, std::uint32_t value) noexcept
+        {
+            *static_cast<volatile std::uint32_t*>(ptr) = value;
+        }
+    } // namespace detail
+
+    /*
+     * Copies from normal host memory into device memory.
+     */
+    inline void deviceMemcpy(void* dst, const void* src, std::size_t bytes)
+    {
+        auto* dstBytes = static_cast<unsigned char*>(dst);
+        const auto* srcBytes = static_cast<const unsigned char*>(src);
+        std::size_t i = 0;
+        // unaligned head: byte accesses only, 32-bit word stores require 4-byte alignment in device memory
+        while(i < bytes && !(detail::isAligned32(dstBytes + i) && detail::isAligned32(srcBytes + i)))
+        {
+            detail::writeVolatileByte(dstBytes + i, srcBytes[i]);
+            ++i;
+        }
+        // aligned body: read the word from host memory, then store it with a single 32-bit device access
+        for(; i + sizeof(std::uint32_t) <= bytes; i += sizeof(std::uint32_t))
+        {
+            std::uint32_t word;
+            std::memcpy(&word, srcBytes + i, sizeof(word));
+            detail::writeVolatileWord(dstBytes + i, word);
+        }
+        // unaligned tail: byte accesses only
+        for(; i < bytes; ++i)
+            detail::writeVolatileByte(dstBytes + i, srcBytes[i]);
+    }
+
+    /*
+     * Copies from device memory into normal host memory.
+     */
+    inline void deviceMemcpyToHost(void* dst, const void* deviceSrc, std::size_t bytes)
+    {
+        auto* dstBytes = static_cast<unsigned char*>(dst);
+        const auto* srcBytes = static_cast<const unsigned char*>(deviceSrc);
+        std::size_t i = 0;
+        // unaligned head: byte accesses only, 32-bit word loads require 4-byte alignment in device memory
+        while(i < bytes && !(detail::isAligned32(dstBytes + i) && detail::isAligned32(srcBytes + i)))
+        {
+            dstBytes[i] = detail::readVolatileByte(srcBytes + i);
+            ++i;
+        }
+        // aligned body: load the word with a 32-bit volatile access, then store it to normal host memory
+        for(; i + sizeof(std::uint32_t) <= bytes; i += sizeof(std::uint32_t))
+        {
+            const std::uint32_t word = detail::readVolatileWord(srcBytes + i);
+            std::memcpy(dstBytes + i, &word, sizeof(word));
+        }
+        // unaligned tail: byte accesses only
+        for(; i < bytes; ++i)
+            dstBytes[i] = detail::readVolatileByte(srcBytes + i);
+    }
+
+    /*
+     * Copies from device memory into device memory.
+     */
+    inline void deviceMemcpyDevice(void* dst, const void* deviceSrc, std::size_t bytes)
+    {
+        auto* dstBytes = static_cast<unsigned char*>(dst);
+        const auto* srcBytes = static_cast<const unsigned char*>(deviceSrc);
+        std::size_t i = 0;
+        // unaligned head: byte accesses only, 32-bit word accesses require 4-byte alignment in device memory
+        while(i < bytes && !(detail::isAligned32(dstBytes + i) && detail::isAligned32(srcBytes + i)))
+        {
+            detail::writeVolatileByte(dstBytes + i, detail::readVolatileByte(srcBytes + i));
+            ++i;
+        }
+        // aligned body: 32-bit volatile load followed by 32-bit volatile store
+        for(; i + sizeof(std::uint32_t) <= bytes; i += sizeof(std::uint32_t))
+        {
+            const std::uint32_t word = detail::readVolatileWord(srcBytes + i);
+            detail::writeVolatileWord(dstBytes + i, word);
+        }
+        // unaligned tail: byte accesses only
+        for(; i < bytes; ++i)
+            detail::writeVolatileByte(dstBytes + i, detail::readVolatileByte(srcBytes + i));
+    }
+
+    /*
+     * Fills device memory with the given byte value (same semantics as memset()).
+     */
+    inline void deviceMemset(void* dst, int value, std::size_t bytes)
+    {
+        auto* dstBytes = static_cast<unsigned char*>(dst);
+        const auto byteValue = static_cast<unsigned char>(value);
+        std::size_t i = 0;
+        // unaligned head: byte accesses only, 32-bit word stores require 4-byte alignment in device memory
+        while(i < bytes && !detail::isAligned32(dstBytes + i))
+        {
+            detail::writeVolatileByte(dstBytes + i, byteValue);
+            ++i;
+        }
+        // aligned body: replicate the byte across a 32-bit word and store it with a 32-bit device access
+        const auto word = static_cast<std::uint32_t>(byteValue) * 0x01010101u;
+        for(; i + sizeof(std::uint32_t) <= bytes; i += sizeof(std::uint32_t))
+            detail::writeVolatileWord(dstBytes + i, word);
+        // unaligned tail: byte accesses only
+        for(; i < bytes; ++i)
+            detail::writeVolatileByte(dstBytes + i, byteValue);
+    }
+} // namespace vc4cl
+
+#endif /* VC4CL_DEVICE_MEMORY_H */

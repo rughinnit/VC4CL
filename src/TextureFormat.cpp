@@ -6,6 +6,7 @@
 
 #include "TextureFormat.h"
 #include "Image.h"
+#include "hal/device_memory.h"
 
 using namespace vc4cl;
 
@@ -35,7 +36,8 @@ std::size_t TextureAccessor::readSinglePixel(
     if(outputSize < pixelWidth)
         return 0;
 
-    memcpy(output, ptr, pixelWidth);
+    // the source is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+    deviceMemcpyToHost(output, ptr, pixelWidth);
     return pixelWidth;
 }
 
@@ -48,7 +50,8 @@ bool TextureAccessor::writeSinglePixel(
     if(inputSize < pixelWidth)
         return false;
 
-    memcpy(ptr, input, pixelWidth);
+    // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+    deviceMemcpy(ptr, input, pixelWidth);
     return true;
 }
 
@@ -315,7 +318,8 @@ void RasterFormatAccessor::readPixelData(const std::array<std::size_t, 3>& pixel
             void* outPtr = reinterpret_cast<void*>(
                 reinterpret_cast<uintptr_t>(output) + z * outputSlicePitch + y * outputRowPitch);
             const void* inPtr = calculatePixelOffset(image.deviceBuffer->hostPointer, inputCoords);
-            memcpy(outPtr, inPtr, pixelRegion[0] * pixelWidth);
+            // the source is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+            deviceMemcpyToHost(outPtr, inPtr, pixelRegion[0] * pixelWidth);
         }
     }
 }
@@ -336,7 +340,9 @@ void RasterFormatAccessor::writePixelData(const std::array<std::size_t, 3>& pixe
             void* inPtr = reinterpret_cast<void*>(
                 reinterpret_cast<uintptr_t>(source) + z * sourceSlicePitch + y * sourceRowPitch);
             void* outPtr = calculatePixelOffset(image.deviceBuffer->hostPointer, outputCoords);
-            memcpy(outPtr, inPtr, pixelRegion[0] * pixelWidth);
+            // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed
+            // (see device_memory.h)
+            deviceMemcpy(outPtr, inPtr, pixelRegion[0] * pixelWidth);
         }
     }
 }

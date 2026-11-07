@@ -9,6 +9,7 @@
 #include "Event.h"
 #include "Kernel.h"
 #include "PerformanceCounter.h"
+#include "hal/device_memory.h"
 #include "hal/hal.h"
 
 #include <CL/opencl.h>
@@ -301,7 +302,8 @@ cl_int executeKernel(KernelExecution& args)
     {
         const void* data_start = kernel->program->globalData.data();
         const unsigned data_length = static_cast<unsigned>(kernel->program->globalData.size() * sizeof(uint64_t));
-        memcpy(p, data_start, data_length);
+        // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+        deviceMemcpy(p, data_start, data_length);
         p += data_length / sizeof(unsigned);
         DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
             std::cout << "Copied " << data_length << " bytes of global data to device buffer" << std::endl)
@@ -314,13 +316,15 @@ cl_int executeKernel(KernelExecution& args)
         std::cout << "Reserving space for " << maxQPUS << " stack-frames of " << stackFrameSize << " bytes each"
                   << std::endl)
     if(kernel->program->context()->initializeMemoryToZero(CL_CONTEXT_MEMORY_INITIALIZE_PRIVATE_KHR))
-        memset(p, '\0', maxQPUS * stackFrameSize);
+        // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+        deviceMemset(p, '\0', maxQPUS * stackFrameSize);
     p += (maxQPUS * stackFrameSize) / sizeof(unsigned);
 
     // Copy QPU program into GPU memory
     const unsigned* qpu_code = p;
     const void* code_start = &kernel->program->binaryCode[kernel->info.getOffset()];
-    memcpy(p, code_start, kernel->info.getLength() * sizeof(uint64_t));
+    // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+    deviceMemcpy(p, code_start, kernel->info.getLength() * sizeof(uint64_t));
     p += kernel->info.getLength() * sizeof(uint64_t) / sizeof(unsigned);
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
         std::cout << "Copied " << kernel->info.getLength() * sizeof(uint64_t)
@@ -410,7 +414,8 @@ cl_int executeKernel(KernelExecution& args)
     unsigned* qpu_uniform_1 = p;
     {
         auto uniformSize = static_cast<size_t>(qpu_uniform_1 - qpu_uniform_0);
-        std::memcpy(qpu_uniform_1, qpu_uniform_0, uniformSize * sizeof(uint32_t));
+        // both sides are Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+        deviceMemcpyDevice(qpu_uniform_1, qpu_uniform_0, uniformSize * sizeof(uint32_t));
         p += uniformSize;
 
         // the UNIFORMs of the second block are exactly the size of the first block after the corresponding UNIFORMs

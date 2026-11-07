@@ -10,6 +10,7 @@
 #include "Device.h"
 #include "PerformanceCounter.h"
 #include "extensions.h"
+#include "hal/device_memory.h"
 #include "hal/hal.h"
 
 #include <algorithm>
@@ -721,14 +722,16 @@ CHECK_RETURN cl_int Kernel::allocateAndTrackBufferArguments(
                     return CL_OUT_OF_RESOURCES;
                 if(initializeMemory)
                 {
-                    // copy the parameter values to the buffer
-                    memcpy(bufIt->second->hostPointer, localArg->data.data(),
+                    // copy the parameter values to the buffer; the destination is Device memory, so only 32-bit
+                    // aligned word/byte accesses are allowed (see device_memory.h)
+                    deviceMemcpy(bufIt->second->hostPointer, localArg->data.data(),
                         std::min(static_cast<unsigned>(localArg->data.size()), localArg->sizeToAllocate));
                 }
                 else if(zeroMemory)
                 {
-                    // we need to initialize the local memory to zero
-                    memset(bufIt->second->hostPointer, '\0', localArg->sizeToAllocate);
+                    // we need to initialize the local memory to zero; the destination is Device memory, so only
+                    // 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+                    deviceMemset(bufIt->second->hostPointer, '\0', localArg->sizeToAllocate);
                 }
                 DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
                     std::cout << "Reserved " << localArg->sizeToAllocate
