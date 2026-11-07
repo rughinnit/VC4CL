@@ -1,0 +1,22 @@
+# Keep the Raspberry Pi 3B V3D power domain on for VC4CL register poking.
+#
+# The VC4CL library itself does not touch the V3D power state: the device path
+# below is board/SoC specific and must stay in system configuration. On a
+# Raspberry Pi 3B the V3D platform device is 3fc00000.v3d.
+#
+# Without this, the vc4 DRM driver may runtime-suspend V3D. Register accesses
+# through /dev/mem then hit a powered-down block and fail or fault.
+#
+# Written as a local sysfs setting instead of a udev rule because
+# power/control defaults to "auto" and is reset on every boot.
+[Unit]
+Description=Keep the VC4CL V3D power domain enabled (Pi 3B)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo on > /sys/bus/platform/devices/3fc00000.v3d/power/control'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
