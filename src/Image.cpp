@@ -7,6 +7,7 @@
 #include "Image.h"
 
 #include "Buffer.h"
+#include "hal/device_memory.h"
 #include "hal/hal.h"
 
 #include <sstream>
@@ -385,7 +386,8 @@ void* Image::enqueueMap(CommandQueue* commandQueue, cl_bool blockingMap, cl_map_
     if(useHostPtr && hostPtr != nullptr)
     {
         //"The host_ptr specified in clCreateImage is guaranteed to contain the latest bits [...]"
-        memcpy(hostPtr, getDeviceHostPointerWithOffset(), hostSize);
+        // the source is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+        deviceMemcpyToHost(hostPtr, getDeviceHostPointerWithOffset(), hostSize);
         //"The pointer value returned by clEnqueueMapImage will be derived from the host_ptr specified when the image
         // object is created."
         out_ptr = hostPtr;

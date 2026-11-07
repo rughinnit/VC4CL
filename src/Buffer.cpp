@@ -5,6 +5,7 @@
  */
 #include "Buffer.h"
 
+#include "hal/device_memory.h"
 #include "hal/hal.h"
 
 #include <iomanip>
@@ -738,7 +739,8 @@ void Buffer::setCopyHostPointer(void* hostPtr, size_t hostSize)
 {
     copyHostPtr = true;
     this->hostSize = hostSize;
-    memmove(deviceBuffer->hostPointer, hostPtr, hostSize);
+    // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+    deviceMemcpy(deviceBuffer->hostPointer, hostPtr, hostSize);
 }
 
 cl_mem_flags Buffer::getMemFlags() const
@@ -790,7 +792,8 @@ cl_int Buffer::copyIntoHostBuffer(size_t offset, size_t size)
     uintptr_t src = reinterpret_cast<uintptr_t>(getDeviceHostPointerWithOffset()) + offset;
     if(dest == src)
         return CL_SUCCESS;
-    memmove(reinterpret_cast<void*>(dest), reinterpret_cast<void*>(src), size);
+    // the source is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+    deviceMemcpyToHost(reinterpret_cast<void*>(dest), reinterpret_cast<void*>(src), size);
     return CL_SUCCESS;
 }
 
@@ -810,7 +813,8 @@ cl_int Buffer::copyFromHostBuffer(size_t offset, size_t size)
         return CL_SUCCESS;
     uintptr_t dest = reinterpret_cast<uintptr_t>(getDeviceHostPointerWithOffset()) + offset;
     uintptr_t src = reinterpret_cast<uintptr_t>(hostPtr) + offset;
-    memmove(reinterpret_cast<void*>(dest), reinterpret_cast<void*>(src), size);
+    // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+    deviceMemcpy(reinterpret_cast<void*>(dest), reinterpret_cast<void*>(src), size);
     return CL_SUCCESS;
 }
 
@@ -906,11 +910,17 @@ cl_int BufferAccess::operator()()
     if(hostPtr == buffer->getDeviceHostPointerWithOffset() && bufferOffset == hostOffset)
         return CL_SUCCESS;
     if(writeToBuffer)
-        memmove(static_cast<char*>(buffer->getDeviceHostPointerWithOffset()) + bufferOffset,
+    {
+        // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+        deviceMemcpy(static_cast<char*>(buffer->getDeviceHostPointerWithOffset()) + bufferOffset,
             static_cast<char*>(hostPtr) + hostOffset, numBytes);
+    }
     else
-        memmove(static_cast<char*>(hostPtr) + hostOffset,
+    {
+        // the source is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+        deviceMemcpyToHost(static_cast<char*>(hostPtr) + hostOffset,
             static_cast<char*>(buffer->getDeviceHostPointerWithOffset()) + bufferOffset, numBytes);
+    }
     return CL_SUCCESS;
 }
 
@@ -954,9 +964,13 @@ cl_int BufferRectAccess::operator()()
                 reinterpret_cast<void*>(devicePointer + bufferRowPitch * y + bufferSlicePitch * z);
             auto hostOffsetPointer = reinterpret_cast<void*>(hostPointer + hostRowPitch * y + hostSlicePitch * z);
             if(writeToBuffer)
-                memmove(bufferOffsetPointer, hostOffsetPointer, region[0]);
+                // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed
+                // (see device_memory.h)
+                deviceMemcpy(bufferOffsetPointer, hostOffsetPointer, region[0]);
             else
-                memmove(hostOffsetPointer, bufferOffsetPointer, region[0]);
+                // the source is Device memory, so only 32-bit aligned word/byte accesses are allowed
+                // (see device_memory.h)
+                deviceMemcpyToHost(hostOffsetPointer, bufferOffsetPointer, region[0]);
         }
     }
     return CL_SUCCESS;
@@ -989,7 +1003,8 @@ cl_int BufferFill::operator()()
     uintptr_t end = start + numBytes;
     while(start < end)
     {
-        memcpy(reinterpret_cast<void*>(start), pattern.data(), pattern.size());
+        // the destination is Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+        deviceMemcpy(reinterpret_cast<void*>(start), pattern.data(), pattern.size());
         start += pattern.size();
     }
     return CL_SUCCESS;
@@ -1016,7 +1031,8 @@ cl_int BufferCopy::operator()()
     uintptr_t dest = reinterpret_cast<uintptr_t>(destBuffer->getDeviceHostPointerWithOffset()) + destOffset;
     if(dest == src)
         return CL_SUCCESS;
-    memmove(reinterpret_cast<void*>(dest), reinterpret_cast<void*>(src), numBytes);
+    // both sides are Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+    deviceMemcpyDevice(reinterpret_cast<void*>(dest), reinterpret_cast<void*>(src), numBytes);
     return CL_SUCCESS;
 }
 
@@ -1051,7 +1067,8 @@ cl_int BufferRectCopy::operator()()
     {
         for(std::size_t y = 0; y < region[1]; ++y)
         {
-            memmove(reinterpret_cast<void*>(destPointer + destRowPitch * y + destSlicePitch * z),
+            // both sides are Device memory, so only 32-bit aligned word/byte accesses are allowed (see device_memory.h)
+            deviceMemcpyDevice(reinterpret_cast<void*>(destPointer + destRowPitch * y + destSlicePitch * z),
                 reinterpret_cast<void*>(sourcePointer + sourceRowPitch * y + sourceSlicePitch * z), region[0]);
         }
     }
