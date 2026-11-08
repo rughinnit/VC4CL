@@ -29,10 +29,6 @@ using namespace vc4cl;
 // that long (e.g. 1min)
 static const std::chrono::milliseconds KERNEL_TIMEOUT{1000};
 
-// get_work_dim, get_local_size, get_local_id, get_num_groups (x, y, z), get_global_offset (x, y, z), global-data,
-// uniform address, max_group_id (x, y, z)
-static const unsigned MAX_HIDDEN_PARAMETERS = 14;
-
 static unsigned AS_GPU_ADDRESS(const unsigned* ptr, DeviceBuffer* buffer)
 {
     const char* tmp = *reinterpret_cast<const char**>(&ptr);
@@ -267,9 +263,16 @@ cl_int executeKernel(KernelExecution& args)
     //
     // ALLOCATE BUFFER
     //
+    // The per-QPU UNIFORM block consists of the implicit UNIFORMs (one 32-bit word per used bit-field) followed by
+    // the explicit kernel arguments. The latter cannot be derived from the parameter metadata alone (a 64-bit
+    // scalar occupies two UNIFORMs per vector-element, a lowered __local parameter a single word, padded types more),
+    // so size the buffer with a word-count upper bound and record the actual layout while writing the UNIFORMs.
+    size_t uniformWordsPerQPU = kernel->info.uniformsUsed.countUniforms();
+    for(const auto& param : kernel->info.parameters)
+        uniformWordsPerQPU += std::max<std::size_t>(1u, (param.getSize() + 3u) / 4u) * param.getVectorElements();
     size_t buffer_size = get_size(args.system->getNumQPUs(), kernel->info.getLength() * sizeof(uint64_t),
-        numQPUs * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount()),
-        kernel->program->globalData.size() * sizeof(uint64_t), kernel->program->moduleInfo.getStackFrameSize());
+        numQPUs * uniformWordsPerQPU, kernel->program->globalData.size() * sizeof(uint64_t),
+        kernel->program->moduleInfo.getStackFrameSize());
 
     std::unique_ptr<DeviceBuffer> buffer(
         args.system->allocateBuffer(static_cast<unsigned>(buffer_size), "VC4CL kernel"));
@@ -424,18 +427,24 @@ cl_int executeKernel(KernelExecution& args)
             uniformPointers[1][i] = uniformPointers[0][i] + uniformSize;
     }
 
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << "UNIFORM block: " << (qpu_uniform_1 - qpu_uniform_0) << " words for " << numQPUs << " QPUs ("
+                  << ((qpu_uniform_1 - qpu_uniform_0) / numQPUs) << " words per QPU, upper bound "
+                  << uniformWordsPerQPU << ")" << std::endl)
+
     /* Build QPU Launch messages */
-    auto uniformsPerQPU = kernel->info.uniformsUsed.countUniforms() + kernel->info.getExplicitUniformCount();
+    // the start of each QPU's UNIFORM block is recorded above: the stride must not be derived from the parameter
+    // metadata, since that does not describe the number of 32-bit words actually written per parameter
     unsigned* qpu_msg_0 = p;
     for(unsigned i = 0; i < numQPUs; ++i)
     {
-        *p++ = AS_GPU_ADDRESS(qpu_uniform_0 + i * uniformsPerQPU, buffer.get());
+        *p++ = AS_GPU_ADDRESS(uniformPointers[0][i], buffer.get());
         *p++ = AS_GPU_ADDRESS(qpu_code, buffer.get());
     }
     unsigned* qpu_msg_1 = p;
     for(unsigned i = 0; i < numQPUs; ++i)
     {
-        *p++ = AS_GPU_ADDRESS(qpu_uniform_1 + i * uniformsPerQPU, buffer.get());
+        *p++ = AS_GPU_ADDRESS(uniformPointers[1][i], buffer.get());
         *p++ = AS_GPU_ADDRESS(qpu_code, buffer.get());
     }
 

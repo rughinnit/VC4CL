@@ -263,9 +263,12 @@ KernelHeader::KernelHeader(const std::size_t& numParameters) : Bitfield(0), work
 
 size_t KernelHeader::getExplicitUniformCount() const
 {
+    // Explicit UNIFORMs are 32-bit words. A parameter can occupy multiple UNIFORMs per vector-element (e.g. a
+    // 64-bit long/double takes two UNIFORMs), so count words and not vector-elements. Types smaller than one word
+    // still occupy a whole UNIFORM.
     size_t count = 0;
     for(const auto& info : parameters)
-        count += info.getVectorElements();
+        count += std::max<std::size_t>(1u, (info.getSize() + 3u) / 4u) * info.getVectorElements();
     return count;
 }
 
