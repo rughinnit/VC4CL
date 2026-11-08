@@ -365,6 +365,9 @@ namespace vc4c
             setParamCount(parameters.size());
         }
 
+        /**
+         * The number of explicit UNIFORMs (32-bit words) required by all kernel parameters
+         */
         size_t getExplicitUniformCount() const;
 
         std::string to_string() const;
