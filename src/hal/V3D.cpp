@@ -243,6 +243,23 @@ bool V3D::hasError(const ErrorType type) const
     return val == 1;
 }
 
+/**
+ * Completes all outstanding writes to the memory-mapped V3D registers.
+ *
+ * The registers are mapped as normal non-cacheable memory (see mapmem()), so a register read can be observed while
+ * earlier writes are still in flight. This is measurable: reading SRQCS directly after queueing the user programs can
+ * return the value of the preceding reset write instead of the queued state. Waiting for the writes to complete before
+ * looking at the queue state is therefore required for the checks below to be meaningful.
+ */
+static void finishRegisterWrites()
+{
+#if defined(__aarch64__) || defined(__arm__)
+    asm volatile("dsb sy" : : : "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+
 ExecutionHandle V3D::executeQPU(
     unsigned numQPUs, std::pair<uint32_t*, unsigned> addressPairs, bool flushBuffer, std::chrono::milliseconds timeout)
 {
@@ -271,8 +288,10 @@ ExecutionHandle V3D::executeQPU(
         v3dBasePointer[V3D_SLCACTL] = 0xFFFFFFFF;
     }
 
-    // reset user program states
-    v3dBasePointer[V3D_SRQCS] = (1 << 7) | (1 << 8) | (1 << 16);
+    // reset the user program state: clear the request queue (QPURQL, bit 0), the queue error flag (QPURQERR,
+    // bit 7), the request counter (QPURQCM, bit 8) and the completed counter (QPURQCC, bit 16). Clearing the queue
+    // is required, otherwise requests left over from a previous (e.g. timed out) launch would be executed as well.
+    v3dBasePointer[V3D_SRQCS] = (1 << 0) | (1 << 7) | (1 << 8) | (1 << 16);
 
     // write uniforms and instructions addresses for all QPUs
     uint32_t* addressBase = addressPairs.first;
@@ -283,22 +302,46 @@ ExecutionHandle V3D::executeQPU(
         addressBase += 2;
     }
 
+    finishRegisterWrites();
+
+    // QPURQERR is set when a request could not be queued (e.g. the request queue was full). Such a program will
+    // never run, so report the failure immediately instead of spinning until the timeout expires.
+    const uint32_t srqcsQueued = v3dBasePointer[V3D_SRQCS];
+    if((srqcsQueued & (1 << 7)) != 0)
+    {
+        std::cout << "[VC4CL] V3D queue error after queueing " << numQPUs << " user programs: SRQCS = 0x"
+                  << std::hex << srqcsQueued << std::dec << " (queue length " << (srqcsQueued & 0x3F)
+                  << ", queue error " << ((srqcsQueued >> 7) & 1) << ")" << std::endl;
+        return ExecutionHandle{false};
+    }
+
     const auto start = std::chrono::high_resolution_clock::now();
     auto basePointer = v3dBasePointer;
     auto checkFunc = [basePointer, numQPUs, start, timeout]() -> bool {
         // wait for completion
         while(true)
         {
-            if(((basePointer[V3D_SRQCS] >> 16) & 0xFF) == numQPUs)
+            const uint32_t srqcs = basePointer[V3D_SRQCS];
+            // the launch only completed if all QPUs are done, the request queue is empty and no queue error is
+            // signaled. The completed counter alone is not sufficient: it may still be rising while requests are
+            // queued and it can already contain the results of a previous launch.
+            if(((srqcs >> 16) & 0xFF) == numQPUs && (srqcs & 0x3F) == 0 && (srqcs & 0x80) == 0)
                 return true;
             if(std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::high_resolution_clock::now() - start) > timeout)
-                break;
+            {
+                // clear the request queue, so the timed out (possibly stuck) launch cannot poison the next one
+                basePointer[V3D_SRQCS] = 1 << 0;
+                std::cout << "[VC4CL] V3D execution timed out after " << timeout.count() << " ms: SRQCS = 0x"
+                          << std::hex << srqcs << std::dec << " (completed " << ((srqcs >> 16) & 0xFF) << " of "
+                          << numQPUs << ", queue length " << (srqcs & 0x3F) << ", queue error "
+                          << ((srqcs >> 7) & 1) << "), cleared request queue" << std::endl;
+                return false;
+            }
             // TODO sleep some time?? so CPU is not fully used for waiting
             // e.g. sleep for the theoretical execution time of the kernel (e.g. #instructions / QPU clock) and then
             // begin active waiting
         }
-        return false;
     };
     return ExecutionHandle{checkFunc};
 }
