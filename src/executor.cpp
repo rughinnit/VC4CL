@@ -29,6 +29,11 @@ using namespace vc4cl;
 // that long (e.g. 1min)
 static const std::chrono::milliseconds KERNEL_TIMEOUT{1000};
 
+// the UNIFORM area base is aligned to a 64-byte cache line, matching what the reference driver does for its
+// per-QPU UNIFORM and launch-message blocks
+static constexpr size_t UNIFORM_BASE_ALIGNMENT_BYTES = 64;
+static constexpr size_t UNIFORM_BASE_ALIGNMENT_WORDS = UNIFORM_BASE_ALIGNMENT_BYTES / sizeof(unsigned);
+
 static unsigned AS_GPU_ADDRESS(const unsigned* ptr, DeviceBuffer* buffer)
 {
     const char* tmp = *reinterpret_cast<const char**>(&ptr);
@@ -270,8 +275,9 @@ cl_int executeKernel(KernelExecution& args)
     size_t uniformWordsPerQPU = kernel->info.uniformsUsed.countUniforms();
     for(const auto& param : kernel->info.parameters)
         uniformWordsPerQPU += std::max<std::size_t>(1u, (param.getSize() + 3u) / 4u) * param.getVectorElements();
+    // the UNIFORM area is rounded up to a 64-byte boundary below, which adds at most 16 words per block
     size_t buffer_size = get_size(args.system->getNumQPUs(), kernel->info.getLength() * sizeof(uint64_t),
-        numQPUs * uniformWordsPerQPU, kernel->program->globalData.size() * sizeof(uint64_t),
+        numQPUs * uniformWordsPerQPU + UNIFORM_BASE_ALIGNMENT_WORDS, kernel->program->globalData.size() * sizeof(uint64_t),
         kernel->program->moduleInfo.getStackFrameSize());
 
     std::unique_ptr<DeviceBuffer> buffer(
@@ -336,6 +342,17 @@ cl_int executeKernel(KernelExecution& args)
     // 2 times (for each UNIFORM block) 16 times (for each possible QPU)
     std::array<std::array<unsigned*, 16>, 2> uniformPointers;
     // Build Uniforms
+    // The UNIFORM area starts wherever the kernel code ends, which is 552 bytes (552 % 64 = 40) for the benchmark
+    // kernels, so the per-QPU blocks straddle 64-byte cache lines. Round the base up to the next 64-byte (16 word)
+    // boundary. The per-QPU pointers are recorded below while writing, so the layout itself is unchanged.
+    {
+        const size_t misalignment = static_cast<size_t>(AS_GPU_ADDRESS(p, buffer.get())) % UNIFORM_BASE_ALIGNMENT_BYTES;
+        if(misalignment != 0)
+            p += (UNIFORM_BASE_ALIGNMENT_BYTES - misalignment) / sizeof(unsigned);
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "UNIFORM base aligned to " << AS_GPU_ADDRESS(p, buffer.get()) << " with " << misalignment
+                      << " bytes of padding" << std::endl)
+    }
     const unsigned* qpu_uniform_0 = p;
     for(unsigned i = 0; i < numQPUs; ++i)
     {
