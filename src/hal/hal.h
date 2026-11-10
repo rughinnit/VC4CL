@@ -23,6 +23,7 @@ namespace vc4cl
     class VCSM;
     #endif
     class VCHI;
+    class DMAHeap;
 
     enum class CacheType : uint8_t
     {
@@ -46,8 +47,9 @@ namespace vc4cl
         MAILBOX,
 	#ifndef NO_VCSM
         VCSM,
-        VCSM_CMA
+        VCSM_CMA,
 	#endif
+        DMAHEAP
     };
 
     enum class SystemQuery : uint8_t
@@ -132,6 +134,13 @@ namespace vc4cl
         bool deallocateBuffer(const DeviceBuffer* buffer);
         bool flushCPUCache(const std::vector<const DeviceBuffer*>& buffers);
 
+        /*
+         * Brackets a host access to a mapped buffer. For cacheable dma-buf mappings these issue DMA_BUF_IOCTL_SYNC,
+         * for all other backends they are no-ops.
+         */
+        bool prepareBufferForHostAccess(const DeviceBuffer* buffer, bool forWriting);
+        bool finishBufferForHostAccess(const DeviceBuffer* buffer, bool forWriting);
+
         CHECK_RETURN ExecutionHandle executeQPU(unsigned numQPUs, std::pair<uint32_t*, unsigned> controlAddress,
             bool flushBuffer, std::chrono::milliseconds timeout);
 
@@ -148,6 +157,7 @@ namespace vc4cl
 	#ifndef NO_VCSM
         std::unique_ptr<VCSM> vcsm;
 	#endif
+        std::unique_ptr<DMAHeap> dmaheap;
         std::unique_ptr<VCHI> vchi;
 
         friend std::shared_ptr<SystemAccess>& system();

@@ -82,6 +82,8 @@ static std::string toString(MemoryManagement mode)
     case MemoryManagement::VCSM_CMA:
         return "VCSM CMA";
     #endif
+    case MemoryManagement::DMAHEAP:
+        return "DMA heap";
     }
     throw std::invalid_argument{"Unknown memory management mode: " + std::to_string(static_cast<unsigned>(mode))};
 }
