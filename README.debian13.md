@@ -412,7 +412,8 @@ gcc 14.2, `-O3`, best of 5:
 
 The GPU is 49-55 times slower on these kernels. The causes are structural: one
 work-item per QPU instead of 16 lanes, 8 of 12 QPUs used, and the hardware mutex
-around every global store. This is a correctness milestone, not a performance one.
+that still guards every global load. This is a correctness milestone, not a
+performance one.
 
 
 ### Store staging (2026-11-11)
