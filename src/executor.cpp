@@ -72,8 +72,8 @@ static unsigned* set_work_item_info(unsigned* ptr, cl_uint num_dimensions,
                   << global_sizes[1] << "), " << group_indices[2] * local_sizes[2] + local_indices[2] << "("
                   << global_sizes[2] << ")" << std::endl;
         if (workItemMergeFactor > 1)
-            std::cout << "\tLocal IDs (sizes): " << (local_indices[0] * workItemMergeFactor) << "-"
-                      << std::min((local_indices[0] + 1) * workItemMergeFactor, local_sizes[0]) << "(" << local_sizes[0] << "), "
+            std::cout << "\tLocal IDs (sizes): " << local_indices[0] << "-"
+                      << std::min(local_indices[0] + workItemMergeFactor, local_sizes[0]) << "(" << local_sizes[0] << "), "
                       << local_indices[1] << "(" << local_sizes[1] << "), " << local_indices[2] << "(" << local_sizes[2] << ")" << std::endl;
         else
             std::cout << "\tLocal IDs (sizes): " << local_indices[0] << "(" << local_sizes[0] << "), " << local_indices[1]
@@ -90,9 +90,11 @@ static unsigned* set_work_item_info(unsigned* ptr, cl_uint num_dimensions,
     if(uniformsUsed.getLocalSizesUsed())
         *ptr++ = static_cast<unsigned>(
             local_sizes[2] << 16 | local_sizes[1] << 8 | local_sizes[0]); /* get_local_size(dim) */
+    // NOTE: local_indices are in work-item units, i.e. the first work-item executed by the QPU (the remaining ones are
+    // executed by the SIMD lanes of the same QPU). The uniform therefore already contains the correct base ID.
     if(uniformsUsed.getLocalIDsUsed())
         *ptr++ = static_cast<unsigned>(
-            local_indices[2] << 16 | local_indices[1] << 8 | (local_indices[0] * workItemMergeFactor)); /* get_local_id(dim) */
+            local_indices[2] << 16 | local_indices[1] << 8 | local_indices[0]); /* get_local_id(dim) */
     if(uniformsUsed.getNumGroupsXUsed())
         *ptr++ = static_cast<unsigned>(global_sizes[0] / local_sizes[0]); /* get_num_groups(0) */
     if(uniformsUsed.getNumGroupsYUsed())
@@ -426,7 +428,9 @@ cl_int executeKernel(KernelExecution& args)
         if(kernel->info.uniformsUsed.getMaxGroupIDZUsed())
             *p++ = static_cast<unsigned>(group_limits[2]);
 
-        increment_index(local_indices, args.localSizes, 1);
+        // one QPU executes workItemMergeFactor work-items (one per SIMD lane), so the local index advances by the
+        // merge factor between two QPUs
+        increment_index(local_indices, args.localSizes, mergeFactor);
     }
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
@@ -528,7 +532,7 @@ cl_int executeKernel(KernelExecution& args)
                 args.localSizes, group_indices, local_indices, global_data,
                 AS_GPU_ADDRESS((*uniformPointers_current)[i], buffer.get()), kernel->info.uniformsUsed, mergeFactor);
 
-            increment_index(local_indices, args.localSizes, 1);
+            increment_index(local_indices, args.localSizes, mergeFactor);
         }
         // wait for and check previous work-group (possible asynchronous) execution
         if(!result.waitFor())
