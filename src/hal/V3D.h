@@ -12,6 +12,7 @@
 #include "hal.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -225,6 +226,26 @@ namespace vc4cl
     private:
         uint32_t* v3dBasePointer;
     };
+
+    /*
+     * A device mapping normalised to page boundaries.
+     *
+     * mmap()/munmap() only accept a page-aligned base address. Mapping an unaligned base therefore maps the
+     * containing pages starting at the aligned base and returns a pointer shifted by the offset of the requested base
+     * inside its page. The same values have to be reconstructed for unmapping, otherwise the mapping is shorter than
+     * requested and munmap() is called on a pointer that is not the mapping base.
+     */
+    struct MemoryMapping
+    {
+        // the page-aligned base address of the mapping
+        uintptr_t alignedBase;
+        // the length of the mapping, including the offset of the requested base inside the first page
+        size_t mappedSize;
+        // the offset of the requested base address inside the first mapped page
+        size_t offset;
+    };
+
+    MemoryMapping getMemoryMapping(uintptr_t base, size_t size) __attribute__((const));
 
     void* mapmem(unsigned base, unsigned size);
     void unmapmem(void* addr, unsigned size);

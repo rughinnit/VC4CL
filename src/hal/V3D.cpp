@@ -374,16 +374,20 @@ uint32_t V3D::busAddressToPhysicalAddress(uint32_t busAddress)
     return busAddress & ~0xC0000000;
 }
 
+MemoryMapping vc4cl::getMemoryMapping(uintptr_t base, size_t size)
+{
+    const auto offset = base % V3D::MEMORY_PAGE_SIZE;
+    return MemoryMapping{base - offset, size + offset, offset};
+}
+
 void* vc4cl::mapmem(unsigned base, unsigned size)
 {
     // TODO this is called once to initialize V3D and every time a buffer is mapped.
     // Can't we cache the memory fd?
     int mem_fd;
-    unsigned offset = base % V3D::MEMORY_PAGE_SIZE;
-    base = base - offset;
-    /*
-    size = size + offset;
-    */
+    // map the pages containing the requested base and return the shifted pointer, so that both the mapping length
+    // and the returned pointer cover the requested range
+    const auto mapping = getMemoryMapping(base, size);
     /* open /dev/mem */
     if((mem_fd = open("/dev/mem", O_RDWR | O_SYNC)) < 0)
     {
@@ -391,8 +395,11 @@ void* vc4cl::mapmem(unsigned base, unsigned size)
         std::cout << "[VC4CL] This program should be run as root. Try prefixing command with: sudo" << std::endl;
         throw std::system_error(errno, std::system_category(), "Failed to open /dev/mem");
     }
-    void* mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED /*|MAP_FIXED*/, mem_fd, base);
-    DEBUG_LOG(DebugLevel::SYSCALL, printf("[VC4CL] base=0x%x, mem=%p\n", base, mem))
+    void* mem = mmap(nullptr, mapping.mappedSize, PROT_READ | PROT_WRITE, MAP_SHARED /*|MAP_FIXED*/, mem_fd,
+        static_cast<off_t>(mapping.alignedBase));
+    DEBUG_LOG(DebugLevel::SYSCALL, printf("[VC4CL] base=0x%llx, mappedSize=0x%zx, offset=0x%zx, mem=%p\n",
+                           static_cast<unsigned long long>(mapping.alignedBase), mapping.mappedSize,
+                           mapping.offset, mem))
     if(mem == MAP_FAILED)
     {
         std::cout << "[VC4CL] mmap error " << mem << std::endl;
@@ -401,17 +408,15 @@ void* vc4cl::mapmem(unsigned base, unsigned size)
         throw std::system_error(errno, std::system_category(), "Error in mapmem");
     }
     close(mem_fd);
-    return reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(mem) + offset);
+    return reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(mem) + mapping.offset);
 }
 
 void vc4cl::unmapmem(void* addr, unsigned size)
 {
-    /*
-    const intptr_t offset = (intptr_t)addr % V3D::MEMORY_PAGE_SIZE;
-    addr = (char *)addr - offset;
-    size = size + offset;
-    */
-    int s = munmap(addr, size);
+    // reconstruct the page-aligned base and the full mapping length from the shifted pointer, since munmap() must be
+    // called on the base address returned by mmap() with the length passed to mmap()
+    const auto mapping = getMemoryMapping(reinterpret_cast<uintptr_t>(addr), size);
+    int s = munmap(reinterpret_cast<void*>(mapping.alignedBase), mapping.mappedSize);
     if(s != 0)
     {
         std::cout << "munmap error " << s << std::endl;
