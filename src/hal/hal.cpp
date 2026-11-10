@@ -368,10 +368,11 @@ bool SystemAccess::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers
 {
     if(dmaheap && memoryManagement == MemoryManagement::DMAHEAP)
         /*
-         * The dma-heap pool is mapped cacheable, so the ARM cache maintenance used for the mailbox backend is not safe
-         * here: "dc civac" would write stale host lines over the GPU results. The QPU does not snoop the ARM caches,
-         * and dma-buf provides DMA_BUF_IOCTL_SYNC as the only supported way to make host writes visible to the GPU
-         * and GPU writes visible to the host.
+         * The dma-heap pool is mapped cacheable, but this kernel's CMA dma-buf exporter does not implement the cache
+         * maintenance for DMA_BUF_IOCTL_SYNC. DMAHeap::flushCPUCache therefore cleans and invalidates every
+         * host-written buffer explicitly before the launch (and still issues the dma-buf hand-over for exporters that
+         * do implement it). Doing this before every launch guarantees that no dirty host line can later be written
+         * back over QPU results.
          */
         return dmaheap->flushCPUCache(buffers);
     #ifndef NO_VCSM
