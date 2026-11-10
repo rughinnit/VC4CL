@@ -7,8 +7,10 @@
 #ifndef VC4CL_DEVICE_MEMORY_H
 #define VC4CL_DEVICE_MEMORY_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 /*
@@ -108,6 +110,9 @@ namespace vc4cl
 #define VC4CL_EL0_DC_IVAC 0
 #endif
 
+    // whether the target kernel provides EL0 "dc ivac", i.e. the only invalidate without write-back
+    constexpr bool hasEl0DcIvac = VC4CL_EL0_DC_IVAC != 0;
+
     inline void invalidateDataCache(void* addr, std::size_t bytes) noexcept
     {
 #if defined(__aarch64__)
@@ -119,6 +124,18 @@ namespace vc4cl
         for(; line < end; line += ARM_CACHE_LINE_SIZE)
             asm volatile("dc ivac, %0" : : "r"(line) : "memory");
 #else
+        // DC CIVAC also writes dirty host cache lines back, which is only harmless when they cannot exist, i.e. for a
+        // non-cacheable host mapping. Warn once, so a cacheable mapping is not silently corrupted.
+        if(!hasEl0DcIvac)
+        {
+            static std::atomic<bool> warnedAboutCivacFallback{false};
+            if(!warnedAboutCivacFallback.exchange(true))
+                std::fprintf(stderr,
+                    "[VC4CL] Warning: EL0 DC IVAC is not available (VC4CL_EL0_DC_IVAC=0), using DC CIVAC to "
+                    "invalidate device memory. DC CIVAC cleans dirty host cache lines back to memory, which is only "
+                    "safe for non-cacheable host mappings such as the /dev/mem mailbox buffers (O_SYNC). For a "
+                    "cacheable mapping this writes stale host data over the GPU results.\n");
+        }
         for(; line < end; line += ARM_CACHE_LINE_SIZE)
             asm volatile("dc civac, %0" : : "r"(line) : "memory");
 #endif
