@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
 #include <memory>
@@ -110,15 +111,17 @@ V3D::V3D()
     // vchiq_release() -> wait_for_completion(), leaving the process unkillable in D state.
     // The peripheral base address is read from the device-tree instead of via bcm_host_get_peripheral_address(), so
     // this no longer depends on libbcm_host at all.
-    v3dBasePointer = static_cast<uint32_t*>(
+    v3dBasePointer = static_cast<volatile uint32_t*>(
         mapmem(busAddressToPhysicalAddress(getPeripheralBaseAddress() + V3D_BASE_OFFSET), V3D_LENGTH));
-    DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] V3D base: " << v3dBasePointer << std::endl)
+    DEBUG_LOG(DebugLevel::SYSCALL,
+        std::cout << "[VC4CL] V3D base: " << static_cast<const void*>(const_cast<uint32_t*>(v3dBasePointer))
+                  << std::endl)
 }
 
 V3D::~V3D()
 {
     // No bcm_host_deinit() here, see the constructor comment above: it would not close the VCHIQ descriptor anyway.
-    unmapmem(v3dBasePointer, V3D_LENGTH);
+    unmapmem(const_cast<uint32_t*>(v3dBasePointer), V3D_LENGTH);
 }
 
 uint32_t V3D::getSystemInfo(const SystemInfo key) const
@@ -260,6 +263,17 @@ static void finishRegisterWrites()
 #endif
 }
 
+namespace
+{
+    // clear the request queue (QPURQL, bit 0), the queue error flag (QPURQERR, bit 7), the request counter
+    // (QPURQCM, bit 8) and the completed counter (QPURQCC, bit 16)
+    constexpr uint32_t SRQCS_RESET = (1 << 0) | (1 << 7) | (1 << 8) | (1 << 16);
+
+    // the reset write is a posted write; the V3D may need a moment to apply it while it finishes a previous launch
+    constexpr unsigned SRQCS_RESET_ATTEMPTS = 10;
+    constexpr unsigned SRQCS_RESET_DELAY_US = 100;
+} // namespace
+
 ExecutionHandle V3D::executeQPU(
     unsigned numQPUs, std::pair<uint32_t*, unsigned> addressPairs, bool flushBuffer, std::chrono::milliseconds timeout)
 {
@@ -275,23 +289,55 @@ ExecutionHandle V3D::executeQPU(
     // https://vc4-notes.tumblr.com/post/125039428234/v3d-registers-not-on-videocore-iv-3d-architecture
     // see errata: https://elinux.org/VideoCore_IV_3D_Architecture_Reference_Guide_errata
 
-    // clear cache (if set)
-    // FIXME when the buffer-flush is disabled (for any consecutive execution), the updated UNIFORM-values are not used,
-    // but the old ones!
-    //-> which results in incorrect executions (except the first one)
-    // XXX can this be re-enabled, if we allocate the host-pointer (Mailbox.cpp) with direct access-mode?
-    // if(flushBuffer)
-    {
-        // clear L2 cache
-        v3dBasePointer[V3D_L2CACTL] = 1 << 2;
-        // clear uniforms and instructions caches (TMU too)
-        v3dBasePointer[V3D_SLCACTL] = 0xFFFFFFFF;
-    }
+    // Clear the V3D L2 and slice caches (instructions, uniforms and TMU).
+    //
+    // The QPU does not snoop the ARM data caches and the dma-heap pool hands the same blocks out again for the next
+    // launch, so the code, uniforms and launch messages of the previous launch can still be resident in the V3D caches
+    // at exactly the addresses this launch reuses. If the caches are not invalidated, the QPU fetches the *previous*
+    // program (and its uniforms) and "completes" it, which looks like a launch that returns before it ran.
+    //
+    // NOTE: these two writes must not be merged into a wider store by the compiler, which is why v3dBasePointer is
+    // volatile: a 64-bit store covering both registers is dropped by the 32-bit V3D register interface and neither
+    // invalidation happens (verified by disassembly and by writing the registers separately).
+    v3dBasePointer[V3D_L2CACTL] = 1 << 2;
+    v3dBasePointer[V3D_SLCACTL] = 0xFFFFFFFF;
+    // the invalidations have to reach the V3D before the user programs are queued below
+    finishRegisterWrites();
 
-    // reset the user program state: clear the request queue (QPURQL, bit 0), the queue error flag (QPURQERR,
-    // bit 7), the request counter (QPURQCM, bit 8) and the completed counter (QPURQCC, bit 16). Clearing the queue
-    // is required, otherwise requests left over from a previous (e.g. timed out) launch would be executed as well.
-    v3dBasePointer[V3D_SRQCS] = (1 << 0) | (1 << 7) | (1 << 8) | (1 << 16);
+    // Reset the user program state. Clearing the queue is required, otherwise requests left over from a previous
+    // (e.g. timed out) launch would be executed as well.
+    const bool debugSrq = std::getenv("VC4CL_DEBUG_SRQ") != nullptr;
+    static unsigned srqLogCount = 0;
+    const bool logSrq = debugSrq && srqLogCount < 40;
+
+    v3dBasePointer[V3D_SRQCS] = SRQCS_RESET;
+    finishRegisterWrites();
+
+    // Verify that the reset is visible before queueing. The completion predicate below accepts "all QPUs completed and
+    // queue empty", which is exactly the state of the *previous* launch. If the reset were still in flight, the first
+    // poll after queueing could match that stale state and the caller would return before this launch has run.
+    uint32_t srqcsReset = 0;
+    bool resetDone = false;
+    for(unsigned attempt = 0; attempt < SRQCS_RESET_ATTEMPTS; ++attempt)
+    {
+        srqcsReset = v3dBasePointer[V3D_SRQCS];
+        if((srqcsReset & 0x3F) == 0 && ((srqcsReset >> 16) & 0xFF) == 0 && (srqcsReset & (1 << 7)) == 0)
+        {
+            resetDone = true;
+            break;
+        }
+        v3dBasePointer[V3D_SRQCS] = SRQCS_RESET;
+        finishRegisterWrites();
+        usleep(SRQCS_RESET_DELAY_US);
+    }
+    if(!resetDone)
+    {
+        std::cout << "[VC4CL] V3D request queue did not reset, refusing to launch " << numQPUs
+                  << " user programs: SRQCS = 0x" << std::hex << srqcsReset << std::dec << " (queue length "
+                  << (srqcsReset & 0x3F) << ", queue error " << ((srqcsReset >> 7) & 1) << ", completed "
+                  << ((srqcsReset >> 16) & 0xFF) << ")" << std::endl;
+        return ExecutionHandle{false};
+    }
 
     // write uniforms and instructions addresses for all QPUs
     uint32_t* addressBase = addressPairs.first;
@@ -307,6 +353,14 @@ ExecutionHandle V3D::executeQPU(
     // QPURQERR is set when a request could not be queued (e.g. the request queue was full). Such a program will
     // never run, so report the failure immediately instead of spinning until the timeout expires.
     const uint32_t srqcsQueued = v3dBasePointer[V3D_SRQCS];
+    if(logSrq)
+    {
+        std::cout << "[VC4CL] SRQ launch " << srqLogCount << ": " << numQPUs << " QPUs, reset=0x" << std::hex
+                  << srqcsReset << ", queue error " << ((srqcsQueued >> 7) & 1) << ", completed "
+                  << ((srqcsQueued >> 16) & 0xFF) << ", queue length " << (srqcsQueued & 0x3F) << std::dec
+                  << std::endl;
+        ++srqLogCount;
+    }
     if((srqcsQueued & (1 << 7)) != 0)
     {
         std::cout << "[VC4CL] V3D queue error after queueing " << numQPUs << " user programs: SRQCS = 0x"

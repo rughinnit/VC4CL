@@ -224,7 +224,14 @@ namespace vc4cl
         bool readValue(SystemQuery query, uint32_t& output) noexcept;
 
     private:
-        uint32_t* v3dBasePointer;
+        /*
+         * The V3D register file is mapped as device memory and every access has side effects, so it must be accessed
+         * through a volatile pointer. Without volatile the compiler may merge neighbouring register writes into one
+         * wider store (e.g. L2CACTL and SLCACTL into a single 64-bit store), which the 32-bit peripheral interface
+         * silently drops - the cache invalidation then never happens and the QPU can execute the previous launch's
+         * cached program.
+         */
+        volatile uint32_t* v3dBasePointer;
     };
 
     /*
