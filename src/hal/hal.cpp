@@ -12,6 +12,7 @@
 #ifndef NO_VCSM
 #include "VCSM.h"
 #endif
+#include "DMAHeap.h"
 #include "device_memory.h"
 #include "emulator.h"
 #include "userland.h"
@@ -58,6 +59,8 @@ static ExecutionMode getExecMode()
 
 static MemoryManagement getMemoryMode()
 {
+    if(std::getenv("VC4CL_MEMORY_DMAHEAP"))
+        return MemoryManagement::DMAHEAP;
     #ifndef NO_VCSM
     if(std::getenv("VC4CL_MEMORY_CMA"))
         return MemoryManagement::VCSM_CMA;
@@ -130,6 +133,17 @@ static std::unique_ptr<VCSM> initializeVCSM(bool isEmulated, MemoryManagement me
 }
 #endif
 
+static std::unique_ptr<DMAHeap> initializeDMAHeap(bool isEmulated, MemoryManagement memoryMode)
+{
+    if(isEmulated || std::getenv("VC4CL_NO_DMAHEAP"))
+        // explicitly disabled
+        return nullptr;
+    if(memoryMode != MemoryManagement::DMAHEAP)
+        // no need for the component
+        return nullptr;
+    return std::unique_ptr<DMAHeap>{new DMAHeap()};
+}
+
 static std::unique_ptr<VCHI> initializeVCHI(bool isEmulated, ExecutionMode execMode)
 {
     if(isEmulated || std::getenv("VC4CL_NO_VCHI"))
@@ -151,6 +165,7 @@ SystemAccess::SystemAccess() :
     #ifndef NO_VCSM
     vcsm(initializeVCSM(isEmulated, memoryManagement)),
     #endif
+    dmaheap(initializeDMAHeap(isEmulated, memoryManagement)),
     vchi(initializeVCHI(isEmulated, executionMode))
 {
     if(isEmulated)
@@ -175,6 +190,9 @@ SystemAccess::SystemAccess() :
                                  "")
                       << std::endl)
     #endif
+    if(dmaheap)
+        DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
+            std::cout << "[VC4CL] Using DMA heap for: memory allocation" << std::endl)
     if(vchi)
         DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
             std::cout << "[VC4CL] Using VCHI for: "
@@ -224,6 +242,8 @@ uint32_t SystemAccess::querySystem(SystemQuery query, uint32_t defaultValue)
     uint32_t value = defaultValue;
     if(isEmulated)
         return getEmulatedSystemQuery(query);
+    if(dmaheap && dmaheap->readValue(query, value))
+        return value;
     #ifndef NO_VCSM
     if(vcsm && vcsm->readValue(query, value))
         return value;
@@ -309,6 +329,8 @@ std::unique_ptr<DeviceBuffer> SystemAccess::allocateBuffer(
     if(isEmulated)
         return allocateEmulatorBuffer(shared_from_this(), sizeInBytes);
     auto effectiveCacheType = forcedCacheType.first ? forcedCacheType.second : cacheType;
+    if(dmaheap && memoryManagement == MemoryManagement::DMAHEAP)
+        return dmaheap->allocateBuffer(shared_from_this(), sizeInBytes, name, effectiveCacheType);
     #ifndef NO_VCSM
     if(vcsm && (memoryManagement == MemoryManagement::VCSM || memoryManagement == MemoryManagement::VCSM_CMA))
         return vcsm->allocateBuffer(shared_from_this(), sizeInBytes, name, effectiveCacheType);
@@ -328,6 +350,8 @@ bool SystemAccess::deallocateBuffer(const DeviceBuffer* buffer)
 {
     if(isEmulated)
         deallocateEmulatorBuffer(buffer);
+    if(dmaheap && memoryManagement == MemoryManagement::DMAHEAP)
+        return dmaheap->deallocateBuffer(buffer);
     #ifndef NO_VCSM	
     if(vcsm && (memoryManagement == MemoryManagement::VCSM || memoryManagement == MemoryManagement::VCSM_CMA))
         return vcsm->deallocateBuffer(buffer);
@@ -339,6 +363,14 @@ bool SystemAccess::deallocateBuffer(const DeviceBuffer* buffer)
 
 bool SystemAccess::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers)
 {
+    if(dmaheap && memoryManagement == MemoryManagement::DMAHEAP)
+        /*
+         * The dma-heap pool is mapped cacheable, so the ARM cache maintenance used for the mailbox backend is not safe
+         * here: "dc civac" would write stale host lines over the GPU results. The QPU does not snoop the ARM caches,
+         * and dma-buf provides DMA_BUF_IOCTL_SYNC as the only supported way to make host writes visible to the GPU
+         * and GPU writes visible to the host.
+         */
+        return dmaheap->flushCPUCache(buffers);
     #ifndef NO_VCSM
     if(vcsm && (memoryManagement == MemoryManagement::VCSM || memoryManagement == MemoryManagement::VCSM_CMA))
         return vcsm->flushCPUCache(buffers);
@@ -365,6 +397,22 @@ bool SystemAccess::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers
         return true;
     }
     return false;
+}
+
+bool SystemAccess::prepareBufferForHostAccess(const DeviceBuffer* buffer, bool forWriting)
+{
+    if(dmaheap && memoryManagement == MemoryManagement::DMAHEAP)
+        return dmaheap->prepareBufferForHostAccess(buffer, forWriting);
+    // all other backends map their buffers coherently (mailbox) or keep a separate host copy (VCSM), so there is
+    // nothing to do before the host access
+    return true;
+}
+
+bool SystemAccess::finishBufferForHostAccess(const DeviceBuffer* buffer, bool forWriting)
+{
+    if(dmaheap && memoryManagement == MemoryManagement::DMAHEAP)
+        return dmaheap->finishBufferForHostAccess(buffer, forWriting);
+    return true;
 }
 
 ExecutionHandle SystemAccess::executeQPU(unsigned numQPUs, std::pair<uint32_t*, unsigned> controlAddress,

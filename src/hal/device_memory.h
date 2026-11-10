@@ -67,6 +67,20 @@ namespace vc4cl
     constexpr std::size_t ARM_CACHE_LINE_SIZE = 64;
 
     /*
+     * Hooks for dma-buf backed device memory (VC4CL_MEMORY_DMAHEAP=1).
+     *
+     * Such mappings are cacheable and are only coherent with the QPU through DMA_BUF_IOCTL_SYNC, which brackets every
+     * host access. The ARM cache maintenance instructions below must NOT be used there: "dc civac" writes dirty host
+     * cache lines back to memory and would overwrite GPU results with stale data if a buffer is read or partially
+     * written by the host after the QPU ran.
+     *
+     * The hooks are implemented by the HAL (hal/DMAHeap.cpp) and are no-ops for all other memory backends.
+     */
+    bool isDmaBufBackedMemory(const void* ptr, std::size_t bytes) noexcept;
+    void beginDmaBufHostAccess(void* ptr, std::size_t bytes, bool write) noexcept;
+    void endDmaBufHostAccess(void* ptr, std::size_t bytes, bool write) noexcept;
+
+    /*
      * Cleans (writes back) and invalidates the ARM data cache lines covering [addr, addr + bytes).
      *
      * Used after the host wrote into device memory, so that the GPU observes the new content and the host does not
@@ -153,6 +167,9 @@ namespace vc4cl
     {
         if(dst == nullptr || src == nullptr || bytes == 0)
             return;
+        const bool dmaBufBacked = isDmaBufBackedMemory(dst, bytes);
+        if(dmaBufBacked)
+            beginDmaBufHostAccess(dst, bytes, true);
         auto* dstBytes = static_cast<unsigned char*>(dst);
         const auto* srcBytes = static_cast<const unsigned char*>(src);
         std::size_t i = 0;
@@ -174,7 +191,10 @@ namespace vc4cl
             detail::writeVolatileByte(dstBytes + i, srcBytes[i]);
 
         // the GPU does not snoop the ARM caches, make the host writes visible to the QPU
-        cleanInvalidateDataCache(dst, bytes);
+        if(dmaBufBacked)
+            endDmaBufHostAccess(dst, bytes, true);
+        else
+            cleanInvalidateDataCache(dst, bytes);
     }
 
     /*
@@ -185,8 +205,12 @@ namespace vc4cl
         if(dst == nullptr || deviceSrc == nullptr || bytes == 0)
             return;
 
+        const bool dmaBufBacked = isDmaBufBackedMemory(deviceSrc, bytes);
         // drop stale host cache lines first, the GPU does not snoop the ARM caches
-        invalidateDataCache(const_cast<void*>(deviceSrc), bytes);
+        if(dmaBufBacked)
+            beginDmaBufHostAccess(const_cast<void*>(deviceSrc), bytes, false);
+        else
+            invalidateDataCache(const_cast<void*>(deviceSrc), bytes);
 
         auto* dstBytes = static_cast<unsigned char*>(dst);
         const auto* srcBytes = static_cast<const unsigned char*>(deviceSrc);
@@ -206,6 +230,10 @@ namespace vc4cl
         // unaligned tail: byte accesses only
         for(; i < bytes; ++i)
             dstBytes[i] = detail::readVolatileByte(srcBytes + i);
+
+        // close the host read session opened above
+        if(dmaBufBacked)
+            endDmaBufHostAccess(const_cast<void*>(deviceSrc), bytes, false);
     }
 
     /*
@@ -240,6 +268,9 @@ namespace vc4cl
     {
         if(dst == nullptr || bytes == 0)
             return;
+        const bool dmaBufBacked = isDmaBufBackedMemory(dst, bytes);
+        if(dmaBufBacked)
+            beginDmaBufHostAccess(dst, bytes, true);
         auto* dstBytes = static_cast<unsigned char*>(dst);
         const auto byteValue = static_cast<unsigned char>(value);
         std::size_t i = 0;
@@ -258,7 +289,10 @@ namespace vc4cl
             detail::writeVolatileByte(dstBytes + i, byteValue);
 
         // the GPU does not snoop the ARM caches, make the host writes visible to the QPU
-        cleanInvalidateDataCache(dst, bytes);
+        if(dmaBufBacked)
+            endDmaBufHostAccess(dst, bytes, true);
+        else
+            cleanInvalidateDataCache(dst, bytes);
     }
 } // namespace vc4cl
 

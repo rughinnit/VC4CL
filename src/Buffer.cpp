@@ -872,6 +872,9 @@ cl_int BufferMapping::operator()()
         // read-only in which case writing to it would have been undefined behavior
         if(!mappingInfo->skipWritingBack)
             status = buffer->copyFromHostBuffer(0, buffer->hostSize);
+        // close the host access session for cacheable dma-buf mappings (no-op for the other backends)
+        if(buffer->deviceBuffer)
+            system()->finishBufferForHostAccess(buffer->deviceBuffer.get(), !mappingInfo->skipWritingBack);
         std::lock_guard<std::mutex> mapGuard(buffer->mappingsLock);
         buffer->mappings.erase(mappingInfo);
     }
@@ -882,6 +885,10 @@ cl_int BufferMapping::operator()()
         // -> when mapping, we need to write the current device buffer contents to the host buffer, unless the
         // client notified us that it does not care about the previous contents, e.g. if the whole buffer will be
         // overwritten anyway
+        // for a cacheable dma-buf mapping, invalidate the host caches before the application accesses the mapped
+        // pointer (no-op for the other backends)
+        if(buffer->deviceBuffer)
+            system()->prepareBufferForHostAccess(buffer->deviceBuffer.get(), !mappingInfo->skipWritingBack);
         if(!mappingInfo->skipPopulatingBuffer)
             status = buffer->copyIntoHostBuffer(0, buffer->hostSize);
     }
