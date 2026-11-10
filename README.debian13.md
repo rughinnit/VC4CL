@@ -391,9 +391,9 @@ each, zero mismatches:
 
 | case | kernel ms |
 |---|---|
-| vector 1024 | 0.51-0.54 |
-| vector 65536 | 17.46-17.48 |
-| vector 1048576 | 275.77-275.81 |
+| vector 1024 | 0.45-0.51 |
+| vector 65536 | 11.2-11.7 |
+| vector 1048576 | 176.4-177.5 |
 | matmul 32 | 3.56 |
 | matmul 64 | 25.08 |
 
@@ -407,12 +407,37 @@ gcc 14.2, `-O3`, best of 5:
 
 | workload | GPU dma-heap | CPU -O3 | CPU no-vectorize |
 |---|---|---|---|
-| add 65536 | 17.4 ms | 0.203 ms | 0.563 ms |
+| add 65536 | 11.2 ms | 0.203 ms | 0.563 ms |
 | matmul 64 | 25.1 ms | 0.513 ms | 1.195 ms |
 
-The GPU is 49-86 times slower on these kernels. The causes are structural: one
+The GPU is 49-55 times slower on these kernels. The causes are structural: one
 work-item per QPU instead of 16 lanes, 8 of 12 QPUs used, and the hardware mutex
 around every global store. This is a correctness milestone, not a performance one.
+
+
+### Store staging (2026-11-11)
+
+Global DMA stores used to take the shared hardware mutex, because every QPU staged
+through the same VPM scratch row. Each QPU now stages in its own row (one row per QPU,
+offset `qpu_number * 64`, the same layout the register-spill path already used), and the
+mutex is gone from the staging store.
+
+Measured on this board:
+
+| workload | before | after |
+|---|---|---|
+| vector add 65536 | 18.0 ms | 11.4 ms |
+| vector add 1048576 | 276 ms | 176 ms |
+| elementwise 1M | 274 ms | 181 ms |
+| reduction 1M | 76 ms | 67 ms |
+| GEMM 64/128/256 | 26 / 220 / 1695 ms | unchanged |
+| 3x3 conv 64x64x32 | 3448 ms | 3425 ms |
+
+GEMM and convolution are load-bound and do not benefit. DMA reads keep the mutex: two
+back-to-back staged reads from the same per-QPU row return wrong data (reproducible at
+`-O0`, values depend on the row position), so the read path stays locked until a
+two-row alternating scheme is validated. The remaining large lever is work-item
+merging, which would fill all 16 lanes of a QPU instead of one.
 
 ### Testing notes
 
