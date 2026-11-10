@@ -391,9 +391,9 @@ each, zero mismatches:
 
 | case | kernel ms |
 |---|---|
-| vector 1024 | 0.45-0.51 |
-| vector 65536 | 11.2-11.7 |
-| vector 1048576 | 176.4-177.5 |
+| vector 1024 | 0.26 (merged) |
+| vector 65536 | 1.21-1.25 (merged) |
+| vector 1048576 | 16.8 (merged) |
 | matmul 32 | 3.56 |
 | matmul 64 | 25.08 |
 
@@ -439,6 +439,43 @@ back-to-back staged reads from the same per-QPU row return wrong data (reproduci
 `-O0`, values depend on the row position), so the read path stays locked until a
 two-row alternating scheme is validated. The remaining large lever is work-item
 merging, which would fill all 16 lanes of a QPU instead of one.
+
+
+### Work-item merging (2026-11-11)
+
+Enabled with `VC4C_MERGE_WORK_ITEMS=16`. Sixteen work-items share a QPU, one per SIMD
+lane, instead of one work-item per QPU. The runtime then chooses a work-group size that
+is a multiple of 16 (128 for a 65536-element launch) and launches one work-group while
+the kernel iterates the rest internally.
+
+Measured, same board, auto local size:
+
+| workload | before | after |
+|---|---|---|
+| vector 1024 | 0.44 ms | 0.26 ms |
+| vector 65536 | 11.3 ms | 1.21-1.25 ms |
+| vector 1048576 | 177 ms | 16.8 ms |
+| matmul 32 / 64 | 3.55 / 25.1 ms | unchanged (factor 1) |
+
+A kernel is merged only when all of the following hold; otherwise it falls back to one
+work-item per QPU and logs the reason:
+
+- no barrier and no thread-control signal
+- no conditional branch (work-item divergence cannot be expressed as a masked store)
+- every lane-dependent memory address advances exactly one element per work-item
+  (contiguous), which is what makes a 16-lane store a single VPM row and DMA
+- local work size is a multiple of 16
+
+The address rule also closed a latent miscompile: kernels with stride-2 accesses, gathers,
+reversed indices or per-work-item vector stores could previously be merged and produce
+wrong values; they are now rejected and run correctly at factor 1.
+
+Merged kernels without cross-work-item dependencies now run VC4C's work-group loop, so one
+submission covers all work-groups; that is what took vector 65536 from 4.0 ms to 1.2 ms.
+
+Known gap: matmul and convolution still run at factor 1, because their per-lane addresses
+are lane-uniform rather than contiguous (`a[(gid/n)*n + k]`) and the compiler cannot prove
+it. Unlocking them needs a per-lane gather path or an address proof.
 
 ### Testing notes
 
