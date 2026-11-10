@@ -217,7 +217,11 @@ static bool flushHostCache(SystemAccess& system, const std::unique_ptr<DeviceBuf
             toBeFlushed.emplace_back(buf.second.get());
     }
     for(auto& buf : persistentBuffers)
-        toBeFlushed.emplace_back(buf.second.first.get());
+    {
+        // a kernel argument set to NULL cl_mem has no buffer, and a buffer without host mapping cannot be flushed
+        if(buf.second.first && buf.second.first->hostPointer)
+            toBeFlushed.emplace_back(buf.second.first.get());
+    }
 
     auto status = system.flushCPUCache(toBeFlushed);
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
