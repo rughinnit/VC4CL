@@ -337,3 +337,89 @@ This fixes the VPM range errors but does **not** fix the deterministic
 lane-scoped mismatch (global IDs congruent to 1 mod 4) seen for vector 65536,
 vector 1048576 and matmul 64. That remaining defect points at per-lane
 uniform/QPU code generation or cache handling, not VPM sizing.
+
+## Resolution (2026-11-10): hardware defect and dma-heap backend
+
+The lane-scoped mismatch described above was **not** code generation. This unit's
+firmware/GPU carveout (top 76 MiB, physical ~0x3B400000-0x3F000000) has
+stuck-at-1 memory cells.
+
+Evidence gathered on this board:
+
+- a buffer round trip with **no kernel** corrupts 3 words per 64 KB block at block
+  offsets 0x3F24, 0x3F34, 0x3F44 (bits 19/21/23, masks 0x00A00000, 0x00A80000,
+  0x00080000)
+- a 4 MB scan shows 192 bad words, i.e. every 64 KB block of the window is affected
+- the bad addresses are fixed in physical space and move with the allocation base
+- a buffer that was never written already reads 1s there; writing zeros leaves them
+  set and the values stay frozen for minutes (stuck-at-1), while writing ones looks
+  clean
+- kernel CMA memory at the same low-16 offsets is clean (0 mismatches in 4 MB and
+  16 MB scans)
+
+Consequently the mailbox backend cannot produce correct results on this unit: the
+earlier figures (23/65536 for vector add, 110/4096 for matmul) are the hardware
+defect, not VC4CL or VC4C.
+
+### dma-heap memory backend (required on this board)
+
+    sudo env VC4CL_MEMORY_DMAHEAP=1 VC4CL_EXECUTE_REGISTER_POKING=1 <application>
+
+- `VC4CL_MEMORY_DMAHEAP=1` allocates from `/dev/dma_heap/linux,cma` instead of the
+  firmware heap: one contiguous pool (`VC4CL_DMAHEAP_POOL_MB`, default 64 MiB,
+  4 KB granularity), physical base discovered once from the kernel log CMA region
+  and verified by a signature scan, GPU bus address `0xC0000000 | phys`.
+  Requires root (`/dev/mem`, `/dev/dma_heap`).
+- `VC4CL_EXECUTE_REGISTER_POKING=1` writes the SRQ registers directly. Do not use
+  `VC4CL_EXECUTE_MAILBOX=1` on this kernel: it can deadlock the firmware mailbox
+  (`rpi_firmware_property_list` stuck in D state).
+
+### Cache-flush fix found along the way
+
+`V3D::v3dBasePointer` was a plain `uint32_t*`, so the compiler merged the adjacent
+`L2CACTL` and `SLCACTL` writes into one 64-bit store, which the 32-bit register
+block drops. Neither cache was invalidated, and with a reused buffer pool every
+launch executed with the previous launch's cached code and uniforms, one launch
+behind. The pointer is now `volatile uint32_t*`, the two writes are separate
+32-bit stores followed by `dsb sy`, and the SRQCS reset is verified (queue empty,
+completed 0, no error) before the requests are queued.
+
+### Validated matrix
+
+dma-heap backend, register poking, `bench_vc4cl all`, two consecutive runs, 5/5
+each, zero mismatches:
+
+| case | kernel ms |
+|---|---|
+| vector 1024 | 0.51-0.54 |
+| vector 65536 | 17.46-17.48 |
+| vector 1048576 | 275.77-275.81 |
+| matmul 32 | 3.56 |
+| matmul 64 | 25.08 |
+
+Through the ICD loader, without `LD_LIBRARY_PATH`: `clinfo` sees the platform, and
+`probe_copy 65536` reports 0 mismatches with dma-heap versus exactly 12 with the
+mailbox default (the hardware defect, reproduced).
+
+### Performance versus the A53 CPU
+
+gcc 14.2, `-O3`, best of 5:
+
+| workload | GPU dma-heap | CPU -O3 | CPU no-vectorize |
+|---|---|---|---|
+| add 65536 | 17.4 ms | 0.203 ms | 0.563 ms |
+| matmul 64 | 25.1 ms | 0.513 ms | 1.195 ms |
+
+The GPU is 49-86 times slower on these kernels. The causes are structural: one
+work-item per QPU instead of 16 lanes, 8 of 12 QPUs used, and the hardware mutex
+around every global store. This is a correctness milestone, not a performance one.
+
+### Testing notes
+
+- The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
+  for loader-based tools; testing an uninstalled build needs a temporary ICD
+  directory plus `OCL_ICD_VENDORS`.
+- `bench_vc4cl` links the library directly and uses `LD_LIBRARY_PATH`.
+- `build/` is `BUILD_ICD=OFF`, `build-icd/` is `BUILD_ICD=ON`; loading the non-ICD
+  library through the ICD loader crashes in `clGetPlatformIDs`.
+- Previous installed libraries are kept in `/usr/local/lib/vc4cl-backup-*`.
