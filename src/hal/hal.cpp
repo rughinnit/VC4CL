@@ -100,7 +100,10 @@ static std::unique_ptr<Mailbox> initializeMailbox(bool isEmulated, ExecutionMode
     if(isEmulated || std::getenv("VC4CL_NO_MAILBOX"))
         // explicitly disabled
         return nullptr;
-    if(execMode != ExecutionMode::MAILBOX_IOCTL && memoryMode != MemoryManagement::MAILBOX)
+    // The mailbox is also needed for the dma-heap backend: its constructor enables the QPUs in the firmware, without
+    // which V3D register-poking requests are queued but never executed. Memory is still allocated from the dma-heap.
+    if(execMode != ExecutionMode::MAILBOX_IOCTL && memoryMode != MemoryManagement::MAILBOX &&
+        memoryMode != MemoryManagement::DMAHEAP)
         // no need for the component
         return nullptr;
     return std::unique_ptr<Mailbox>(new Mailbox());
