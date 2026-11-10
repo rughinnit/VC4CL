@@ -432,6 +432,9 @@ static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NU
     if(compile_group_sizes[0] == 0 && compile_group_sizes[1] == 0 && compile_group_sizes[2] == 0)
         // no compile-time sizes set
         return false;
+    if(mergeFactor > 1 && (compile_group_sizes[0] % mergeFactor) != 0)
+        // the work-items are merged along dimension 0, so its size must be a multiple of the merge factor
+        return false;
     const cl_uint max_group_size = system()->getNumQPUs() * mergeFactor;
 
     if((global_sizes[0] % compile_group_sizes[0]) != 0 || (global_sizes[1] % compile_group_sizes[1]) != 0 ||
@@ -460,7 +463,7 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
 {
     const size_t total_sizes = global_sizes[0] * global_sizes[1] * global_sizes[2];
     const cl_uint max_group_size = system()->getNumQPUs() * mergeFactor;
-    if(total_sizes <= max_group_size)
+    if(total_sizes <= max_group_size && (mergeFactor <= 1 || (global_sizes[0] % mergeFactor) == 0))
     {
         // can be executed in a single work-group
         local_sizes[0] = global_sizes[0];
@@ -486,7 +489,12 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
      */
 
     // for now choose method 2
-    for(cl_uint work_group_size = max_group_size; work_group_size > 0; --work_group_size)
+    // With merged work-items, the work-items of a work-group are aligned to the SIMD lanes along dimension 0, so only
+    // local sizes which are a multiple of the merge factor can be used.
+    const std::size_t mergeFactorStep = mergeFactor > 1 ? mergeFactor : 1;
+    const std::size_t highestWorkGroupSize = (max_group_size / mergeFactorStep) * mergeFactorStep;
+    for(std::size_t work_group_size = highestWorkGroupSize; work_group_size >= mergeFactorStep;
+        work_group_size -= mergeFactorStep)
     {
         // starting by all QPUs, try to determine a number of QPUs, which can be used,
         // so the total number of items can be evenly distributed among them
@@ -617,6 +625,17 @@ cl_int Kernel::setWorkGroupSizes(CommandQueue* commandQueue, cl_uint work_dim, c
                     static_cast<unsigned>(compileLocalSizes.at(0)),
                     static_cast<unsigned>(compileLocalSizes.at(1)),
                     static_cast<unsigned>(compileLocalSizes.at(2))));
+        }
+        if(mergeFactor > 1 && requestedLocalSizes.at(0) % mergeFactor != 0)
+        {
+            // The work-items are merged along dimension 0, so the number of work-items in that dimension must be a
+            // multiple of the number of SIMD lanes.
+            return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
+                buildString("Local work-size for kernel %s is not a multiple of the work-item merge factor: "
+                            "local (%u, %u, %u), merge factor %u",
+                    info.name.c_str(), static_cast<unsigned>(requestedLocalSizes.at(0)),
+                    static_cast<unsigned>(requestedLocalSizes.at(1)),
+                    static_cast<unsigned>(requestedLocalSizes.at(2)), static_cast<unsigned>(mergeFactor)));
         }
         memcpy(local_sizes.data(), local_work_size, work_dim * sizeof(size_t));
     }
