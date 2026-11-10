@@ -581,15 +581,45 @@ cl_int Kernel::setWorkGroupSizes(CommandQueue* commandQueue, cl_uint work_dim, c
         // TODO "CL_INVALID_WORK_GROUP_SIZE if local_work_size is NULL and the __attribute__((reqd_work_group_size(X, Y,
         // Z))) qualifier is used to declare the work-group size for kernel in the program source."
     }
-    else if((info.workGroupSize[0] != 0) && local_work_size[0] != info.workGroupSize[0] &&
-        (work_dim < 2 || local_work_size[1] != info.workGroupSize[1]) &&
-        (work_dim < 3 || local_work_size[2] != info.workGroupSize[2]))
-        return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
-            buildString("Local work size does not match the compile-time work-size: %u(%u), %u(%u), %u(%u)",
-                local_work_size[0], info.workGroupSize[0], work_dim < 2 ? 1 : local_work_size[1], info.workGroupSize[1],
-                work_dim < 3 ? 1 : local_work_size[2], info.workGroupSize[2]));
     else
+    {
+        // Compare the requested local work-size against the work-group size the kernel was compiled for
+        // (__attribute__((reqd_work_group_size))), normalised to three dimensions. Joining the per-dimension
+        // comparisons with a single conjunction accepted a local size that differed in only one dimension, because
+        // the remaining dimensions were then equal and the whole condition became false.
+        std::array<size_t, kernel_config::NUM_DIMENSIONS> compileLocalSizes = {{1, 1, 1}};
+        std::array<size_t, kernel_config::NUM_DIMENSIONS> requestedLocalSizes = {{1, 1, 1}};
+        bool hasCompileTimeLocalSize = false;
+        for(size_t i = 0; i < kernel_config::NUM_DIMENSIONS; ++i)
+        {
+            compileLocalSizes.at(i) = std::max<size_t>(info.workGroupSize.at(i), 1);
+            requestedLocalSizes.at(i) = i < work_dim ? local_work_size[i] : 1;
+            hasCompileTimeLocalSize |= info.workGroupSize.at(i) != 0;
+        }
+        // A zero in the local work-size is not a valid work-group size. It passes all other checks and later divides
+        // by zero when the work-items are split over the QPUs.
+        if(requestedLocalSizes.at(0) == 0 || requestedLocalSizes.at(1) == 0 || requestedLocalSizes.at(2) == 0)
+        {
+            return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
+                buildString("Local work-size for kernel %s contains a zero: %u, %u, %u", info.name.c_str(),
+                    static_cast<unsigned>(requestedLocalSizes.at(0)),
+                    static_cast<unsigned>(requestedLocalSizes.at(1)),
+                    static_cast<unsigned>(requestedLocalSizes.at(2))));
+        }
+        if(hasCompileTimeLocalSize && requestedLocalSizes != compileLocalSizes)
+        {
+            return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
+                buildString("Local work-size for kernel %s does not match the compile-time work-group size: "
+                            "local (%u, %u, %u), compiled for (%u, %u, %u)",
+                    info.name.c_str(), static_cast<unsigned>(requestedLocalSizes.at(0)),
+                    static_cast<unsigned>(requestedLocalSizes.at(1)),
+                    static_cast<unsigned>(requestedLocalSizes.at(2)),
+                    static_cast<unsigned>(compileLocalSizes.at(0)),
+                    static_cast<unsigned>(compileLocalSizes.at(1)),
+                    static_cast<unsigned>(compileLocalSizes.at(2))));
+        }
         memcpy(local_sizes.data(), local_work_size, work_dim * sizeof(size_t));
+    }
     if(exceedsLimits<size_t>(work_sizes[0], 0, kernel_config::MAX_WORK_ITEM_DIMENSIONS[0]) ||
         exceedsLimits<size_t>(work_sizes[1], 0, kernel_config::MAX_WORK_ITEM_DIMENSIONS[1]) ||
         exceedsLimits<size_t>(work_sizes[2], 0, kernel_config::MAX_WORK_ITEM_DIMENSIONS[2]))
