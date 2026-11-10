@@ -8,6 +8,15 @@
 
 **VC4CL** is an implementation of the **OpenCL 1.2** standard for the VideoCore IV GPU (found in Raspberry Pi 1 - 3 models).
 
+## Debian 13 arm64 port
+
+A port to Debian 13 arm64 (Raspberry Pi 3B, 64-bit kernel) is documented in
+[README.debian13.md](README.debian13.md). Besides the build and installation
+steps it describes a dma-heap memory backend that is required on boards whose
+GPU memory carveout has defective cells, and it tells the full story of the
+accuracy and cache bugs found while validating the port.
+
+
 The implementation consists of:
 
 * The **VC4CL** OpenCL runtime library, running on the host CPU to compile, run and interact with OpenCL kernels.
