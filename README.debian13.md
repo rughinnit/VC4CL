@@ -423,3 +423,214 @@ around every global store. This is a correctness milestone, not a performance on
 - `build/` is `BUILD_ICD=OFF`, `build-icd/` is `BUILD_ICD=ON`; loading the non-ICD
   library through the ICD loader crashes in `clGetPlatformIDs`.
 - Previous installed libraries are kept in `/usr/local/lib/vc4cl-backup-*`.
+
+## Appendix: how the last 0.03 percent was found
+
+This is the long form of the investigation, because the bug that remained after the port
+worked was misleading in almost every way, and the method that finally found it is more
+useful than the fix.
+
+### 1. The symptom
+
+After the port was functional, `bench_vc4cl` reported:
+
+```
+vector 65536 :  23 wrong of 65536     (0.035 %)
+matmul 64    : 110 wrong of  4096     (2.7 %)
+```
+
+The failures were sparse, deterministic within a run, and always at local ids 1 and 5 with
+local size 8. Since the device has 4 QPUs per slice, ids 1 and 5 are the second QPU of each
+of the two slices in use. The wrong values looked like results computed from a neighbouring
+work-item's data, and a store-only kernel (`c[i] = i`) also corrupted, so it was not the
+load path.
+
+That shape - sparse, lane-scoped, deterministic - looked exactly like a race in QPU code
+generation or a cache-coherence bug. It was neither.
+
+### 2. The falsification log
+
+Every one of these was a reasonable hypothesis. Each was implemented, measured, and
+rejected on evidence. Keeping the measurements is what eventually made the real cause
+obvious.
+
+**VPMBASE.** The vc4 driver zeroes `V3D_VPMBASE` on probe and on runtime-PM resume, so user
+programs had no reserved VPM. Re-arming it to 16 units (4096 bytes, the HW-2253 window)
+removed `ERRSTAT` bits 4 and 5 permanently. The mismatch count did not move. A real bug,
+unrelated to the symptom.
+
+**The work-group loop.** VC4C's `loop-work-groups` pass folds the whole kernel into one
+launch that iterates work-groups internally. Disabling it should have isolated the loop, and
+it did change behaviour - for the worse:
+
+```
+loop enabled  : 23 / 65536 wrong
+loop disabled : 57344-65517 / 65536 wrong, plus hangs
+```
+
+Every launch after the first then ran with the previous launch's uniforms. That is a real
+defect in the per-launch path, but it proved the loop was not the source of the sparse
+errors.
+
+**Uniform ordering and alignment.** A source audit showed the uniform pointer reset sits in
+one basic block and the next iteration's uniform reads in another, with no dependency edge
+between them; the Broadcom two-instruction rule was satisfied only by accident. Emitting two
+`WAIT_UNIFORM` nops (69 -> 71 instructions, verified in the disassembly) changed nothing:
+23 wrong, identical indices. Padding the per-QPU uniform blocks to a 64-byte boundary, and
+separately aligning the uniform area base, also changed nothing.
+
+**Optimization level.** `-O0`, `-O1` and `-O0 -cl-opt-disable` produced the same 23 wrong
+results at the same indices. Register allocation and instruction scheduling were eliminated.
+
+**SRQ protocol hygiene.** The runtime never cleared the request queue, never checked
+`QPURQERR`, and could be satisfied by stale completion counts. All of it was fixed: queue
+clear plus `dsb sy`, error check, "queue empty and no error" in the predicate, timeout
+draining, and per-QPU uniform blocks addressed through recorded pointers instead of a
+metadata-derived stride. The baseline stayed at 23 / 110.
+
+**Local size.** Requesting local sizes 4, 2 and 1 produced half, three quarters and seven
+eighths of the output missing, with writes running past the end of the buffer. That turned
+out to be a separate contract bug: the runtime accepted a local size that did not match the
+kernel's compile-time `reqd_work_group_size`. Fixed by a per-dimension check.
+
+By this point every software candidate had been measured and rejected, and the numbers had
+not moved by a single index.
+
+### 3. The pivot: test the data path without the GPU
+
+The step that broke the case was to stop testing kernels and test the buffer path alone:
+create a buffer, fill it with a pattern where each 32-bit word encodes its index in both
+halves, read it back. No kernel, no QPU, no TMU.
+
+It corrupted 12 of 65536 words, identically on four consecutive readbacks.
+
+```
+i=10189  expected 0x674d27cd  got 0x67ed27cd
+```
+
+The low halfword was always correct and the upper halfword belonged to another index. That
+also explained an earlier red herring: the corrupted values looked like results from "the
+next work-group" because the mask, viewed as a float index offset, numerically resembled a
+640-byte shift.
+
+A store-only kernel, a load-only kernel, and a full add all failed at the same indices with
+the same values - the kernels were reading and writing correct data that was already wrong.
+
+### 4. Proving that the memory itself is defective
+
+The fault turned out to be hardware, and it took five independent measurements to be sure:
+
+1. **Periodicity.** Three words per 64 KB block, at block offsets 0x3F24, 0x3F34, 0x3F44,
+   with masks 0x00A00000, 0x00A80000, 0x00080000 (data bits 19, 21, 23). A 4 MB scan found
+   192 bad words: every 64 KB block of the window, not a local island.
+2. **Address binding.** Shifting the allocation moved the bad buffer offsets by exactly the
+   same amount, so the bad addresses are fixed in physical space. Three different bus aliases
+   of the same physical memory failed identically.
+3. **Set-only behaviour.** A buffer that was never written already read ones at those words.
+   Writing zeros left them set, writing ones looked clean, and rewriting never cleared them.
+   The values stayed frozen for minutes.
+4. **Frequency.** The fault only appeared above the kernel's usable RAM, in the firmware/GPU
+   carveout (top 76 MiB). Anonymous memory and the kernel CMA pool were clean at the same
+   low-16 offsets.
+5. **No allocator workaround.** Reserving 0 to 16 MB at startup never moved the failures,
+   because the mailbox heap is anchored below the peripheral window and grows downward; the
+   faulty block is always the first one handed out. Lowering `gpu_mem` would have given the
+   bad range to Linux instead, which is worse.
+
+Conclusion: this specific board has stuck-at-1 cells in its GPU memory. The earlier figures
+(23/65536, 110/4096) are the hardware, not VC4CL or VC4C.
+
+### 5. Working around it: a dma-heap backend
+
+The 256 MB CMA pool at physical 0x1E000000 is in ordinary RAM and was clean in 4 MB and
+16 MB scans, including the exact fault offsets. So the fix was to stop using the firmware
+heap:
+
+- allocate one contiguous pool from `/dev/dma_heap/linux,cma` (default 64 MiB)
+- map it once for the host and sub-allocate 4 KB-aligned buffers from it
+- derive the GPU bus address as `0xC0000000 | physical`
+
+The interesting obstacle: `/proc/self/pagemap` returns zero for dma-buf mappings even as
+root, because they are PFNMAP VMAs, so the physical base cannot be looked up. The base is
+therefore discovered once by writing a signature at both ends of the pool and locating it
+through a read-only `/dev/mem` scan, bounded by the CMA region reported in the kernel log
+(11 ms in practice).
+
+### 6. Two bugs the new backend exposed
+
+**The QPU was never enabled.** The `Mailbox` constructor is what issues the firmware
+`ENABLE_QPU` call. With the dma-heap backend no mailbox object was created, so requests were
+queued and nothing ever executed. Fixed by constructing the mailbox for both backends while
+still allocating memory from the pool.
+
+**`DMA_BUF_IOCTL_SYNC` is a no-op on this kernel's CMA exporter.** After the sync, 4080 of
+4096 bytes were still invisible through an uncached view of the same physical page, while
+`dc civac` made all 4096 visible. The QPU was fetching stale code and uniforms. Buffers are
+now explicitly cleaned and invalidated before each launch.
+
+### 7. The best bug: a compiler-merged MMIO store
+
+With both of those fixed, the full benchmark matrix still failed 2-4 of 5 cases per run, and
+the signature was odd: `matmul 32` finished in 4 ms instead of 25 ms and its output buffer
+was untouched, still holding the previous case's results. Delaying the completion check by
+100 ms changed nothing, so it was not an early return. A dump of the kernel buffer matched
+the host view. The data was correct in DRAM.
+
+A two-kernel probe - two different programs, same code address - showed the truth:
+
+```
+phase 2, kernel A expected 0x1001: read 0x1000 0x1001 0x1002
+phase 3, kernel A expected 0x2002: read 0x1000 0x1001 0x1002
+```
+
+The QPU was executing the previous program with the previous uniforms. Every launch ran one
+launch behind.
+
+The cause was in the disassembly of `executeQPU`:
+
+```
+ldr d31, [x0, #2856]    ; one 64-bit constant 0xFFFFFFFF00000004
+str d31, [x1, #32]      ; L2CACTL and SLCACTL in a single 64-bit store
+```
+
+`v3dBasePointer` was a plain `uint32_t*`, so the compiler merged the two adjacent cache-flush
+writes into one 64-bit store. The V3D register block is 32-bit; that store is dropped, and
+neither the L2 nor the slice caches were ever invalidated. With a reused buffer pool, the
+previous launch's code and uniforms stayed cached at exactly the reused addresses.
+
+The fix: `volatile uint32_t*` for the register pointer, two separate 32-bit stores followed
+by `dsb sy`, and an unconditional SRQ reset verification (queue empty, completed 0, no error)
+with bounded retries before queueing.
+
+### 8. Where it stands
+
+With the dma-heap backend:
+
+```
+vector 1024      0 / 1024        0.5 ms
+vector 65536     0 / 65536      17.5 ms
+vector 1048576   0 / 1048576   276   ms
+matmul 32        0 / 1024        3.6 ms
+matmul 64        0 / 4096       25.1 ms
+```
+
+Two consecutive full matrices, 5/5 each, zero mismatches, repeated after the final commit.
+
+Performance is a separate matter: the GPU is 49-86 times slower than the four Cortex-A53
+cores on these kernels, because the port runs one work-item per QPU instead of 16 lanes,
+uses 8 of 12 QPUs, and serialises every global store through the hardware mutex.
+
+### 9. Lessons that transferred
+
+- Sparse and deterministic does not imply "race in the GPU". Test the data path in isolation
+  before believing any theory about the execution units.
+- A failing test that changes when you change unrelated things (optimization level, loop
+  structure) may be changing memory layout, not logic.
+- When a value looks like another work-item's data, check whether it is a copy or a bit
+  pattern. Halfword contamination and a neighbouring index can look identical in floating
+  point.
+- Compiler-merged stores to adjacent MMIO registers are real, silent, and catastrophic.
+  `volatile` on the register pointer is not optional.
+- Reserved hardware memory can be defective. A board that passes RAM tests can still have
+  broken cells in the GPU carveout, and the only reliable test is a pattern round trip with
+  no kernel involved.
