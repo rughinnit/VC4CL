@@ -24,9 +24,12 @@ namespace vc4cl
      * pool and searching physical RAM through /dev/mem, optionally bounded to the CMA region announced in the kernel
      * log, and verified against a second marker at the end of the pool.
      *
-     * The host mapping is cacheable. Cache maintenance for the QPU therefore goes through DMA_BUF_IOCTL_SYNC (see
-     * flushCPUCache and the hooks in device_memory.h); the ARM "dc civac" fallback of the mailbox backend must not be
-     * used for this memory.
+     * The host mapping is cacheable. The CMA dma-buf exporter on this kernel does not implement CPU cache maintenance
+     * for DMA_BUF_IOCTL_SYNC (verified: END|WRITE leaves dirty host lines in the cache), so cache coherence is
+     * enforced with explicit ARM clean+invalidate over the accessed ranges: before every QPU launch (so the QPU sees
+     * all host writes) and around host accesses (see flushCPUCache, prepareBufferForHostAccess and the hooks in
+     * device_memory.h). No dirty host line can survive a launch, which is what makes invalidating before a host read
+     * safe.
      */
     class DMAHeap
     {
@@ -80,7 +83,6 @@ namespace vc4cl
         void markBlocks(size_t firstBlock, size_t numBlocks, bool used);
 
         bool isInsidePool(const DeviceBuffer* buffer) const;
-        bool syncBuffer(const DeviceBuffer* buffer, uint64_t direction, bool start);
 
         void fillSignature();
         void discoverPhysicalBase();

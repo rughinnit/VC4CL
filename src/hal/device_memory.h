@@ -69,10 +69,10 @@ namespace vc4cl
     /*
      * Hooks for dma-buf backed device memory (VC4CL_MEMORY_DMAHEAP=1).
      *
-     * Such mappings are cacheable and are only coherent with the QPU through DMA_BUF_IOCTL_SYNC, which brackets every
-     * host access. The ARM cache maintenance instructions below must NOT be used there: "dc civac" writes dirty host
-     * cache lines back to memory and would overwrite GPU results with stale data if a buffer is read or partially
-     * written by the host after the QPU ran.
+     * Such mappings are cacheable. This kernel's CMA dma-buf exporter does not implement cache maintenance for
+     * DMA_BUF_IOCTL_SYNC (verified: END|WRITE leaves the written data dirty in the ARM cache), so the hooks perform
+     * explicit clean+invalidate of the accessed range instead. This is safe because the HAL cleans every host-written
+     * buffer before each QPU launch, so no dirty host line can cover QPU output when the host reads back.
      *
      * The hooks are implemented by the HAL (hal/DMAHeap.cpp) and are no-ops for all other memory backends.
      */

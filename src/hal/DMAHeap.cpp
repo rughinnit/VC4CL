@@ -239,19 +239,29 @@ void vc4cl::beginDmaBufHostAccess(void* ptr, std::size_t bytes, bool write) noex
 {
     if(!isDmaBufBackedMemory(ptr, bytes))
         return;
-    // Invalidate the host caches before the CPU writes (and discards any stale line left over from an earlier GPU
-    // write), so a partially written cache line cannot later be written back over GPU results.
-    dmaBufSync(hookFd, DMA_BUF_SYNC_START | (write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ),
-        write ? "host-write-start" : "host-read-start");
+    /*
+     * The CMA dma-buf exporter on this kernel does not implement CPU cache maintenance for DMA_BUF_IOCTL_SYNC: an
+     * END|WRITE sync leaves the written data dirty in the ARM cache (verified by reading the same physical page
+     * through a non-cacheable /dev/mem mapping). Maintain the ARM caches explicitly for the accessed range instead.
+     *
+     * Clean+invalidate before the host access is safe here:
+     * - before a host write it writes back earlier host data and drops stale lines, so a partially written cache
+     *   line cannot later be written back over QPU results;
+     * - before a host read it drops the (clean) host lines, so the read observes what the QPU wrote.
+     * No dirty line can cover QPU output at this point, because flushCPUCache() cleans every host-written buffer
+     * before each QPU launch.
+     */
+    (void) write;
+    cleanInvalidateDataCache(ptr, bytes);
 }
 
 void vc4cl::endDmaBufHostAccess(void* ptr, std::size_t bytes, bool write) noexcept
 {
     if(!isDmaBufBackedMemory(ptr, bytes))
         return;
-    // Clean the host writes back to memory (or close the read access) before the buffer is handed back to the QPU.
-    dmaBufSync(hookFd, DMA_BUF_SYNC_END | (write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ),
-        write ? "host-write-end" : "host-read-end");
+    // Host writes must be in memory before the QPU runs; a read access does not change the device memory.
+    if(write)
+        cleanInvalidateDataCache(ptr, bytes);
 }
 
 DMAHeap::DMAHeap() :
@@ -304,6 +314,9 @@ DMAHeap::DMAHeap() :
     // find (and verify) it.
     std::memcpy(hostBase, signature, sizeof(signature));
     std::memcpy(static_cast<char*>(hostBase) + poolSize - sizeof(signature), signature, sizeof(signature));
+    // The dma-buf sync is a no-op for this exporter, so clean the signature lines explicitly before scanning /dev/mem.
+    cleanInvalidateDataCache(hostBase, sizeof(signature));
+    cleanInvalidateDataCache(static_cast<char*>(hostBase) + poolSize - sizeof(signature), sizeof(signature));
     dmaBufSync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE, "pool signature");
 
     try
@@ -544,39 +557,47 @@ bool DMAHeap::isInsidePool(const DeviceBuffer* buffer) const
     return address >= begin && address <= begin + poolSize && buffer->size <= begin + poolSize - address;
 }
 
-bool DMAHeap::syncBuffer(const DeviceBuffer* buffer, uint64_t direction, bool start)
+bool DMAHeap::prepareBufferForHostAccess(const DeviceBuffer* buffer, bool forWriting)
 {
     if(!isInsidePool(buffer))
         return false;
-    return dmaBufSync(fd, (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | direction, "buffer");
-}
-
-bool DMAHeap::prepareBufferForHostAccess(const DeviceBuffer* buffer, bool forWriting)
-{
-    return syncBuffer(buffer, forWriting ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ, true);
+    (void) forWriting;
+    // see beginDmaBufHostAccess(): clean+invalidate before the application touches the mapping
+    cleanInvalidateDataCache(buffer->hostPointer, buffer->size);
+    return true;
 }
 
 bool DMAHeap::finishBufferForHostAccess(const DeviceBuffer* buffer, bool forWriting)
 {
-    return syncBuffer(buffer, forWriting ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ, false);
+    if(!isInsidePool(buffer))
+        return false;
+    if(forWriting)
+        // the application wrote through the mapping, publish it to the QPU
+        cleanInvalidateDataCache(buffer->hostPointer, buffer->size);
+    return true;
 }
 
 bool DMAHeap::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers)
 {
     for(const auto* buffer : buffers)
     {
-        if(buffer != nullptr && !isInsidePool(buffer))
+        if(buffer == nullptr)
+            continue;
+        if(!isInsidePool(buffer))
             return false;
+        /*
+         * Explicit ARM clean+invalidate is the operation that actually publishes the host writes to the QPU: the CMA
+         * dma-buf exporter on this kernel ignores DMA_BUF_IOCTL_SYNC (verified by reading the same pages through a
+         * non-cacheable /dev/mem mapping after END|WRITE). Cleaning here also covers the raw UNIFORM stores written
+         * by executor.cpp, so this must run once before every launch.
+         */
+        cleanInvalidateDataCache(buffer->hostPointer, buffer->size);
     }
     /*
-     * DMA_BUF_IOCTL_SYNC applies to the whole dma-buf, it has no offset/length. Boxing individual buffers with
-     * START|WRITE/END|WRITE here would invalidate the entire pool on the first START, dropping host writes that are
-     * still dirty in the caches but not committed yet (e.g. the raw UNIFORM stores in executor.cpp). Therefore the
-     * host-to-device hand-over first commits the dirty lines with END|WRITE, and only then runs the regular
-     * START|WRITE/END|WRITE pair, which is safe once all dirty data is in memory.
+     * Keep the dma-buf hand-over for exporters that do implement cache maintenance. On this kernel it is a no-op;
+     * a START|WRITE invalidate after the explicit clean above cannot lose data.
      */
-    bool status = dmaBufSync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE, "flush commit");
-    status = dmaBufSync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE, "flush start") && status;
+    bool status = dmaBufSync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE, "flush start");
     status = dmaBufSync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE, "flush end") && status;
     return status;
 }
