@@ -557,6 +557,27 @@ versus 2.28 ms with the six-QPU `96x1` split (1.84x). At N=128/256 a 12-QPU spli
 geometrically impossible for these tile shapes (the group would have to divide `(128,32)`
 with a multiple-of-16 column block), so those stay at 8 QPUs with unchanged timings.
 
+### Per-QPU VPM areas and the hardware QPU numbering (2026-11-12)
+
+Merged kernels keep per-QPU VPM areas: one row per QPU for global store staging and, under
+register pressure, four spill areas. These are addressed by the **hardware** QPU number,
+and that number is not the launch index: a 12-QPU launch reports 11..0, an 8-QPU launch
+11..4, a 4-QPU launch 11,10,9,8. The V3D fills the highest-numbered QPUs first.
+
+The areas were previously sized by the number of instances in the work-group, so a kernel
+compiled with `reqd_work_group_size(64)` reserved 4 rows (60..63) while the running QPUs
+addressed rows 71..68; the QPU-side setup wraps at 6 bits and wrote rows 7..4 while the
+DMA setup read 71..68, so stores landed from the wrong row. That is the previously recorded
+"staging at 60..63 instead of 52..63" miscompile, and it also explains the wedge seen with
+high-register-pressure kernels.
+
+Per-QPU areas now reserve one row per hardware QPU (12) whatever the work-group size, a
+compile-time check refuses any area that would leave the 64-row user window, and the
+allocator prints the row ranges. `reqd_work_group_size` 16/32/64/128 are all correct now,
+256 is rejected with a clear message, and the 8- and 16-accumulator GEMM variants run
+instead of wedging: 23.2 ms and 22.5 ms at N=256 (1.45 and 1.49 GFLOP/s) versus 29.0 ms
+for 4 accumulators.
+
 ### Testing notes
 
 - The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
