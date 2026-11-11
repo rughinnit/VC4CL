@@ -548,6 +548,15 @@ a uniform loop) merges and is correct for every local size from 32 to 192 work-i
 matmul moved from 0.39/1.71 ms to 0.42/2.15 ms, the price of replicating the lane-invariant
 operand of the mixed multiply-add in its inner loop; the other workloads are unchanged.
 
+### Multi-dimensional work-group splitting (2026-11-12)
+
+Local-size selection can now spread a merged work-group over dimension 1 as well as
+dimension 0. For a tiled GEMM whose dimension 0 is the 16-column axis this matters: at
+N=96 the runtime picks `16x12` and uses all 12 QPUs, running `gemm_vec4a` in 1.24 ms
+versus 2.28 ms with the six-QPU `96x1` split (1.84x). At N=128/256 a 12-QPU split is
+geometrically impossible for these tile shapes (the group would have to divide `(128,32)`
+with a multiple-of-16 column block), so those stay at 8 QPUs with unchanged timings.
+
 ### Testing notes
 
 - The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
