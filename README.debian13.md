@@ -464,7 +464,7 @@ Measured, same board, auto local size:
 A kernel is merged only when all of the following hold; otherwise it falls back to one
 work-item per QPU and logs the reason:
 
-- no barrier and no thread-control signal
+- no thread-control signal
 - every conditional branch has a condition which is provably independent of the
   work-item ID, since a branch inside a merged kernel is executed once for the whole QPU
 - every lane-dependent memory address is either read via TMU (one address per SIMD lane,
@@ -490,6 +490,63 @@ at factor 1.
 
 Merged kernels without cross-work-item dependencies now run VC4C's work-group loop, so one
 submission covers all work-groups; that is what took vector 65536 from 4.0 ms to 1.2 ms.
+
+### Work-group barriers in merged kernels (2026-11-11)
+
+`barrier()` no longer prevents merging. The 16 work-items on the SIMD lanes of one QPU
+execute in lockstep, so the whole QPU arrives at the barrier once and the semaphore
+rendezvous only needs one arrival per QPU. The barrier is therefore indexed by the QPU
+slot within the work-group and the number of participants is
+`ceil(local size / merge factor)`:
+
+- the index is derived from the linear local work-item ID (`local ID >> log2(factor)`),
+  which is `factor * slot + lane` for merged work-items, so all lanes yield the same slot
+  and the slots are exactly `0..numParticipants-1`;
+- it is deliberately not the hardware QPU number (`vc4cl_qpu_number()`), because the QPUs
+  of a work-group are not numbered from zero: a work-group spread over 4 QPUs runs on the
+  QPUs numbered 8..11, while the semaphore protocol requires the primary participant to be
+  index 0;
+- the work-group loop's own synchronization block is used for merged kernels too, it is
+  lowered by the same code.
+
+Two further fixes were needed for the `__local` buffers that reductions depend on:
+
+- a work-group buffer is kept in RAM for merged kernels instead of being placed in a
+  per-QPU VPM area, which cannot hold the elements of the whole work-group;
+- the lane-invariant operands of an instruction which also has a per-lane operand are now
+  replicated to all 16 lanes. Previously such a mix (e.g. a value read from a
+  work-group-uniform `__local` address added to a per-work-item value) only reached the
+  first lane, which made every reduction read the wrong values.
+
+The strict fallback is kept: a kernel which reads the QPU number and has a barrier stays
+unmerged (its barriers could be inside control flow which diverges between the QPUs), as
+does a barrier kernel with a compile-time work-group size (`__attribute__((reqd_work_group_size))`),
+because merged kernels with a known work-group size are broken independently of barriers
+(no barrier at all: the same kernel with and without the attribute takes 2.1 ms vs 0.42 ms
+and only the first SIMD lane reaches memory, the VPM staging area is allocated at rows
+60..63 instead of 52..63). That is the pre-merging behaviour for such kernels and needs to
+be fixed in the VPM allocation.
+
+Measured, same board, `VC4C_MERGE_WORK_ITEMS=16`, auto local size unless noted:
+
+| workload | factor 1 | factor 16 |
+|---|---|---|
+| reduction 1M, tree over `__local` (local 8 vs 128) | 193 ms | 23.3 ms |
+| reduction 1M, read whole group array (local 8 vs 128) | 142 ms | 34.8 ms |
+| dnnbench reduction 1M (local 8, per-lane tree) | 85.5 ms | rejected, stays at factor 1 |
+| vector 65536 / 1048576 | 11.3 / 177 ms | 1.24 / 16.6 ms |
+| matmul 32 / 64 | 3.55 / 25.1 ms | 0.42 / 2.15 ms |
+| GEMM 128 | 217.9 ms | 13.4 ms |
+| elementwise 1M | 177 ms | 16.8 ms |
+| 3x3 conv 64x64x32, clamping | 2992 ms | 174.6 ms |
+
+The dnnbench reduction kernel is rejected because its loop condition (`i < n` with a
+per-work-item `i`) and its `if (lid < k)` steps are lane-dependent, not because of the
+barrier; a tree reduction written with lane-parallel steps (masking by integer division in
+a uniform loop) merges and is correct for every local size from 32 to 192 work-items.
+
+matmul moved from 0.39/1.71 ms to 0.42/2.15 ms, the price of replicating the lane-invariant
+operand of the mixed multiply-add in its inner loop; the other workloads are unchanged.
 
 ### Testing notes
 
