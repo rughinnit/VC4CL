@@ -455,27 +455,41 @@ Measured, same board, auto local size:
 | vector 1024 | 0.44 ms | 0.26 ms |
 | vector 65536 | 11.3 ms | 1.21-1.25 ms |
 | vector 1048576 | 177 ms | 16.8 ms |
-| matmul 32 / 64 | 3.55 / 25.1 ms | unchanged (factor 1) |
+| matmul 32 / 64 | 3.55 / 25.1 ms | 0.39 / 1.71 ms |
+| GEMM 64 / 128 / 256 | 25.3 / 217.9 / 1688.6 ms | 1.85 / 13.4 / 100.6 ms |
+| elementwise 1M | 177 ms | 16.6 ms |
+| 3x3 conv 64x64x32, clamping | 2992 ms | 174.6 ms |
+| 3x3 conv 64x64x32, branching | 3448 ms | unchanged (rejected, factor 1) |
 
 A kernel is merged only when all of the following hold; otherwise it falls back to one
 work-item per QPU and logs the reason:
 
 - no barrier and no thread-control signal
-- no conditional branch (work-item divergence cannot be expressed as a masked store)
-- every lane-dependent memory address advances exactly one element per work-item
-  (contiguous), which is what makes a 16-lane store a single VPM row and DMA
+- every conditional branch has a condition which is provably independent of the
+  work-item ID, since a branch inside a merged kernel is executed once for the whole QPU
+- every lane-dependent memory address is either read via TMU (one address per SIMD lane,
+  a gather) or advances exactly one element per work-item (contiguous)
+- every store address advances exactly one element per work-item and every value written
+  per work-item is a single 32-bit element
 - local work size is a multiple of 16
 
 The address rule also closed a latent miscompile: kernels with stride-2 accesses, gathers,
 reversed indices or per-work-item vector stores could previously be merged and produce
 wrong values; they are now rejected and run correctly at factor 1.
 
+Read-only memory at a lane-dependent address is lowered to a per-lane TMU address vector
+(a gather), so strided and reversed reads merge too: stride-2 at 65536 elements takes
+1.24 ms instead of 32.8 ms, a clamped 3x3 convolution 8.8 ms instead of 131.8 ms.
+
+The lane-uniform branch rule allowed the loop conditions of matmul and of the
+channel-looped convolution to merge. The condition is resolved from the branch flags and
+its operands are walked back through their definitions, including the flags of
+conditionally executed writers; a condition derived from a work-item ID, the element
+number or a per-lane load is still rejected, so the branching dnnbench convolution stays
+at factor 1.
+
 Merged kernels without cross-work-item dependencies now run VC4C's work-group loop, so one
 submission covers all work-groups; that is what took vector 65536 from 4.0 ms to 1.2 ms.
-
-Known gap: matmul and convolution still run at factor 1, because their per-lane addresses
-are lane-uniform rather than contiguous (`a[(gid/n)*n + k]`) and the compiler cannot prove
-it. Unlocking them needs a per-lane gather path or an address proof.
 
 ### Testing notes
 
