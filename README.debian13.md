@@ -433,7 +433,8 @@ Measured on this board:
 | GEMM 64/128/256 | 26 / 220 / 1695 ms | unchanged |
 | 3x3 conv 64x64x32 | 3448 ms | 3425 ms |
 
-GEMM and convolution are load-bound and do not benefit. DMA reads keep the mutex: two
+These are the store-staging numbers only; work-item merging (below) supersedes them.
+GEMM and convolution are load-bound and do not benefit from store staging alone. DMA reads keep the mutex: two
 back-to-back staged reads from the same per-QPU row return wrong data (reproducible at
 `-O0`, values depend on the row position), so the read path stays locked until a
 two-row alternating scheme is validated. The remaining large lever is work-item
