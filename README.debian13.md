@@ -394,8 +394,8 @@ each, zero mismatches:
 | vector 1024 | 0.26 (merged) |
 | vector 65536 | 1.21-1.25 (merged) |
 | vector 1048576 | 16.8 (merged) |
-| matmul 32 | 3.56 |
-| matmul 64 | 25.08 |
+| matmul 32 | 0.39-0.40 (merged) |
+| matmul 64 | 1.71 (merged) |
 
 Through the ICD loader, without `LD_LIBRARY_PATH`: `clinfo` sees the platform, and
 `probe_copy 65536` reports 0 mismatches with dma-heap versus exactly 12 with the
@@ -407,13 +407,12 @@ gcc 14.2, `-O3`, best of 5:
 
 | workload | GPU dma-heap | CPU -O3 | CPU no-vectorize |
 |---|---|---|---|
-| add 65536 | 11.2 ms | 0.203 ms | 0.563 ms |
-| matmul 64 | 25.1 ms | 0.513 ms | 1.195 ms |
+| add 65536 | 1.21 ms | 0.203 ms | 0.563 ms |
+| matmul 64 | 1.71 ms | 0.513 ms | 1.195 ms |
 
-The GPU is 49-55 times slower on these kernels. The causes are structural: one
-work-item per QPU instead of 16 lanes, 8 of 12 QPUs used, and the hardware mutex
-that still guards every global load. This is a correctness milestone, not a
-performance one.
+With work-item merging enabled the GPU is 1.1-6 times slower on these kernels; before
+merging it was 22-86 times slower. What remains is memory bandwidth, the hardware mutex
+on loads, and the fact that only 8 of the 12 QPUs are used for power-of-two global sizes.
 
 
 ### Store staging (2026-11-11)
