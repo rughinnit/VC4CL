@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <vector>
 
 using namespace vc4cl;
 
@@ -423,6 +424,38 @@ cl_int Kernel::getArgInfo(cl_uint arg_index, cl_kernel_arg_info param_name, size
 }
 
 /*
+ * The local sizes are passed to the work-items as UNIFORMs with 8 bits per dimension (and so are the local IDs), so no
+ * local dimension may exceed this value.
+ */
+static constexpr std::size_t MAX_LOCAL_SIZE = 255;
+
+/*
+ * Collects all divisors of the given size which are at most max_value (in ascending order)
+ */
+static void collect_divisors(std::size_t size, std::size_t max_value, std::vector<std::size_t>& divisors)
+{
+    divisors.clear();
+    for(std::size_t divisor = 1; divisor <= size && divisor <= max_value; ++divisor)
+    {
+        if(size % divisor == 0)
+            divisors.push_back(divisor);
+    }
+}
+
+/*
+ * Determines the largest divisor of size which is at most max_value. There always is at least the divisor 1.
+ */
+static std::size_t find_largest_divisor(std::size_t size, std::size_t max_value)
+{
+    for(std::size_t divisor = std::min(size, max_value); divisor > 1; --divisor)
+    {
+        if(size % divisor == 0)
+            return divisor;
+    }
+    return 1;
+}
+
+/*
  * Tries to split the global sizes into the sizes specified at compile-time
  */
 static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NUM_DIMENSIONS>& compile_group_sizes,
@@ -432,6 +465,8 @@ static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NU
     if(compile_group_sizes[0] == 0 && compile_group_sizes[1] == 0 && compile_group_sizes[2] == 0)
         // no compile-time sizes set
         return false;
+    // The compile-time work-group size is fixed by the kernel, so there is nothing to split here. It may be up to three
+    // dimensional though, in which case the QPUs are distributed over all dimensions by the executor.
     if(mergeFactor > 1 && (compile_group_sizes[0] % mergeFactor) != 0)
         // the work-items are merged along dimension 0, so its size must be a multiple of the merge factor
         return false;
@@ -450,6 +485,67 @@ static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NU
     local_sizes[1] = compile_group_sizes[1];
     local_sizes[2] = compile_group_sizes[2];
     return true;
+}
+
+/*
+ * Tries to split the work-items into a multi-dimensional work-group, so that
+ * - every local dimension divides the corresponding global dimension
+ * - the local size of dimension 0 is a multiple of the merge factor, so the work-items merged into the SIMD lanes of
+ *   one QPU stay contiguous along dimension 0
+ * - the largest possible number of QPUs is used
+ *
+ * With merged work-items, a one-dimensional split of dimension 0 cannot use the QPUs which do not fit into that
+ * dimension, e.g. for 12 QPUs and a merge factor of 16 only the largest multiple of 16 which divides global[0] can be
+ * used. Distributing the remaining QPUs over dimensions 1 and 2 uses the whole machine for such work-items.
+ *
+ * Returns the number of QPUs of the found split (0 if none was found), the local sizes are only written on success.
+ *
+ * The splits are ordered by the number of QPUs they use, most QPUs first, because that is what decides the speed. On a
+ * tie, the split with the smallest local size in dimension 0 wins: it keeps the column block of one work-group as small
+ * as possible and spreads the QPUs over the higher dimensions, so the loads of the higher dimensions are shared between
+ * more QPUs. The remaining ties are broken by the local sizes of dimensions 1 and 2, in this order. For the GEMM shape
+ * at N = 96 the ordering picks (16, 12, 1) and measures 1.24 ms, against 2.28 ms for the one-dimensional 6-QPU split.
+ */
+static std::size_t find_multi_dimensional_split(
+    const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& global_sizes,
+    std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, std::size_t max_group_size, uint8_t mergeFactor)
+{
+    std::vector<std::size_t> divisors_0;
+    std::vector<std::size_t> divisors_1;
+    collect_divisors(global_sizes[0], std::min(max_group_size, MAX_LOCAL_SIZE), divisors_0);
+    collect_divisors(global_sizes[1], std::min(max_group_size, MAX_LOCAL_SIZE), divisors_1);
+
+    std::size_t best_num_qpus = 0;
+    std::array<std::size_t, kernel_config::NUM_DIMENSIONS> best_sizes = {{1, 1, 1}};
+    for(const auto local_0 : divisors_0)
+    {
+        if(local_0 % mergeFactor != 0)
+            // the merged work-items of one QPU are contiguous along dimension 0
+            continue;
+        // dimensions 1 and 2 share the QPUs which are left over by dimension 0
+        const std::size_t max_local_1 = max_group_size / local_0;
+        for(const auto local_1 : divisors_1)
+        {
+            if(local_1 > max_local_1)
+                break;
+            const std::size_t max_local_2 = max_group_size / (local_0 * local_1);
+            const std::size_t local_2 =
+                find_largest_divisor(global_sizes[2], std::min(max_local_2, MAX_LOCAL_SIZE));
+            const std::size_t num_qpus = (local_0 * local_1 * local_2) / mergeFactor;
+            const std::array<std::size_t, kernel_config::NUM_DIMENSIONS> sizes = {{local_0, local_1, local_2}};
+            // std::array compares lexicographically, so on an equal number of QPUs the split with the smaller
+            // dimension 0 is kept, then the one with the smaller dimension 1, then the one with the smaller dimension 2
+            if(num_qpus > best_num_qpus || (num_qpus == best_num_qpus && sizes < best_sizes))
+            {
+                best_num_qpus = num_qpus;
+                best_sizes = sizes;
+            }
+        }
+    }
+    if(best_num_qpus == 0)
+        return 0;
+    local_sizes = best_sizes;
+    return best_num_qpus;
 }
 
 /*
@@ -487,8 +583,16 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
      * -> produces x * global[1] * global[2] work-groups
      * - works always, wastes QPUs if global[0] smaller than the number of QPUs
      */
+    /*
+     * Method 3: split the first dimension as in method 2 and distribute the QPUs which are left over by it over the
+     * remaining dimensions, keeping the local size of dimension 0 a multiple of the merge factor.
+     * - works, if the higher dimensions have enough divisors
+     */
 
-    // for now choose method 2
+    std::array<std::size_t, kernel_config::NUM_DIMENSIONS> best_sizes = {{1, 1, 1}};
+    std::size_t best_num_qpus = 0;
+
+    // method 2
     // With merged work-items, the work-items of a work-group are aligned to the SIMD lanes along dimension 0, so only
     // local sizes which are a multiple of the merge factor can be used.
     const std::size_t mergeFactorStep = mergeFactor > 1 ? mergeFactor : 1;
@@ -498,23 +602,40 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
     {
         // starting by all QPUs, try to determine a number of QPUs, which can be used,
         // so the total number of items can be evenly distributed among them
-        if(global_sizes[0] % work_group_size == 0)
+        if(global_sizes[0] % work_group_size == 0 && work_group_size <= MAX_LOCAL_SIZE)
         {
-            local_sizes[0] = work_group_size;
-            local_sizes[1] = 1;
-            local_sizes[2] = 1;
-            // last, check whether the number of work-items in a work-group fits into the limit
-            if(local_sizes[0] * local_sizes[1] * local_sizes[2] <= max_group_size)
-            {
-                // we found an acceptable distribution
-                DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
-                    std::cout << "Splitting " << global_sizes[0] << " * " << global_sizes[1] << " * " << global_sizes[2]
-                              << " work-items into " << local_sizes[0] << " * " << local_sizes[1] << " * "
-                              << local_sizes[2] << ", using " << work_group_size << " of " << max_group_size << " QPUs"
-                              << std::endl)
-                return CL_SUCCESS;
-            }
+            best_sizes = {{work_group_size, 1, 1}};
+            best_num_qpus = work_group_size / mergeFactorStep;
+            break;
         }
+    }
+
+    // method 3, only useful with merged work-items (otherwise the QPUs are the work-items) and more than one dimension
+    if(mergeFactor > 1 && num_dimensions > 1 && (global_sizes[1] > 1 || global_sizes[2] > 1))
+    {
+        std::array<std::size_t, kernel_config::NUM_DIMENSIONS> split_sizes = {{1, 1, 1}};
+        const std::size_t split_num_qpus =
+            find_multi_dimensional_split(global_sizes, split_sizes, max_group_size, mergeFactor);
+        // Only replace the one-dimensional split when the multi-dimensional one uses strictly more QPUs. On a tie the
+        // one-dimensional split wins, which keeps the previous behaviour for every shape where the number of divisible
+        // QPUs is already the maximum (e.g. 8 of 12 QPUs at N = 128 and N = 256, where 12 is geometrically impossible).
+        if(split_num_qpus > best_num_qpus)
+        {
+            best_sizes = split_sizes;
+            best_num_qpus = split_num_qpus;
+        }
+    }
+
+    if(best_num_qpus > 0)
+    {
+        // we found an acceptable distribution
+        local_sizes = best_sizes;
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "Splitting " << global_sizes[0] << " * " << global_sizes[1] << " * " << global_sizes[2]
+                      << " work-items into " << local_sizes[0] << " * " << local_sizes[1] << " * " << local_sizes[2]
+                      << ", using " << best_num_qpus << " of " << static_cast<unsigned>(system()->getNumQPUs())
+                      << " QPUs" << std::endl)
+        return CL_SUCCESS;
     }
 
     // we didn't find any good distribution

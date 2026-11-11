@@ -135,6 +135,28 @@ static bool increment_index(std::array<std::size_t, kernel_config::NUM_DIMENSION
     return indices[2] < limits[2];
 }
 
+/*
+ * Determines the local indices of the first work-item executed by the given QPU within its work-group.
+ *
+ * With merged work-items, the merge factor consecutive work-items executed by the SIMD lanes of one QPU always belong
+ * to dimension 0. The local size of dimension 0 is therefore split into column groups of the merge factor, and these
+ * column groups are assigned to the QPUs first. Only then the QPUs are walked along dimensions 1 and 2, so a work-group
+ * which is split over several QPUs in those dimensions gives every QPU a distinct local index there.
+ *
+ * For a merge factor of 1 this is exactly the linear walk over the work-group, and for a one-dimensional grid with
+ * merged work-items every QPU gets dimension 0 = 0 and the QPU index scaled by the merge factor, as before.
+ */
+static std::array<std::size_t, kernel_config::NUM_DIMENSIONS> get_qpu_local_indices(
+    const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, std::size_t qpu, size_t mergeFactor)
+{
+    const std::size_t column_groups = std::max<std::size_t>(local_sizes[0] / mergeFactor, 1);
+    std::array<std::size_t, kernel_config::NUM_DIMENSIONS> indices = {{(qpu % column_groups) * mergeFactor, 0, 0}};
+    qpu /= column_groups;
+    indices[1] = qpu % local_sizes[1];
+    indices[2] = (qpu / local_sizes[1]) % local_sizes[2];
+    return indices;
+}
+
 static void dumpBuffer(std::ostream& os, const DeviceBuffer* buffer)
 {
     if(!buffer || !buffer->hostPointer)
@@ -255,7 +277,6 @@ cl_int executeKernel(KernelExecution& args)
         args.globalSizes[2] / args.localSizes[2],
     };
     std::array<std::size_t, kernel_config::NUM_DIMENSIONS> group_indices = {0, 0, 0};
-    std::array<std::size_t, kernel_config::NUM_DIMENSIONS> local_indices = {0, 0, 0};
 
     // if the "loop-work-groups" optimization is enabled, all work-items are executed by the first call
     bool isWorkGroupLoopEnabled = kernel->info.uniformsUsed.getMaxGroupIDXUsed() ||
@@ -364,7 +385,8 @@ cl_int executeKernel(KernelExecution& args)
     {
         uniformPointers[0][i] = p;
         p = set_work_item_info(p, args.numDimensions, args.globalOffsets, args.globalSizes, args.localSizes,
-            group_indices, local_indices, global_data, AS_GPU_ADDRESS(p, buffer.get()), kernel->info.uniformsUsed, mergeFactor);
+            group_indices, get_qpu_local_indices(args.localSizes, i, mergeFactor), global_data,
+            AS_GPU_ADDRESS(p, buffer.get()), kernel->info.uniformsUsed, mergeFactor);
         for(unsigned u = 0; u < kernel->info.parameters.size(); ++u)
         {
             auto tmpBufferIt = args.tmpBuffers.find(u);
@@ -427,10 +449,6 @@ cl_int executeKernel(KernelExecution& args)
             *p++ = static_cast<unsigned>(group_limits[1]);
         if(kernel->info.uniformsUsed.getMaxGroupIDZUsed())
             *p++ = static_cast<unsigned>(group_limits[2]);
-
-        // one QPU executes workItemMergeFactor work-items (one per SIMD lane), so the local index advances by the
-        // merge factor between two QPUs
-        increment_index(local_indices, args.localSizes, mergeFactor);
     }
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
@@ -524,15 +542,12 @@ cl_int executeKernel(KernelExecution& args)
         // switch between current and next launch message and UNIFORM blocks
         std::swap(qpu_msg_current, qpu_msg_next);
         std::swap(uniformPointers_current, uniformPointers_next);
-        local_indices[0] = local_indices[1] = local_indices[2] = 0;
         // re-set indices and offsets for all QPUs
         for(cl_uint i = 0; i < numQPUs; ++i)
         {
             set_work_item_info((*uniformPointers_current)[i], args.numDimensions, args.globalOffsets, args.globalSizes,
-                args.localSizes, group_indices, local_indices, global_data,
+                args.localSizes, group_indices, get_qpu_local_indices(args.localSizes, i, mergeFactor), global_data,
                 AS_GPU_ADDRESS((*uniformPointers_current)[i], buffer.get()), kernel->info.uniformsUsed, mergeFactor);
-
-            increment_index(local_indices, args.localSizes, mergeFactor);
         }
         // wait for and check previous work-group (possible asynchronous) execution
         if(!result.waitFor())
