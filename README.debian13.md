@@ -578,6 +578,29 @@ allocator prints the row ranges. `reqd_work_group_size` 16/32/64/128 are all cor
 instead of wedging: 23.2 ms and 22.5 ms at N=256 (1.45 and 1.49 GFLOP/s) versus 29.0 ms
 for 4 accumulators.
 
+### Redundant lane-invariant replication (2026-11-12)
+
+Merging needs a lane-invariant scalar broadcast into all 16 lanes before a divergent
+instruction can use it. `replicateLaneInvariantOperands()` was doing that once per *use
+site*, so the lane-invariant divisor of the four run-time division expansions was copied
+separately inside each of the ~63 clamp sequences: 236 `rep_all` in one conv kernel, 190
+of them the identical `or rep_all|r5, rb3, rb3`.
+
+That cost 8.8% on the clamped 3x3 convolution: 189.99 ms against 174.62 ms with replication
+disabled, measured interleaved (7 pairs, clock fixed at 1.200 GHz, `throttled=0x0`). It was
+not the VPM layout change, which produces an identical area map for this kernel.
+
+Replications are now emitted once per basic block per source local, invalidated at block
+boundaries and by any write to the source; special registers are never cached. Only values
+that can be lane-partial are replicated at all - scalar memory reads, vector element
+extraction, lane-dependent special registers and their transitive closure - because
+everything else is already all-lane identical and replication is the identity. Register
+allocation cannot do this itself: each replication is a distinct special-register
+definition that overwrites the previous one.
+
+The conv kernel returns to 10392 B / 1273 instructions / 15 `rep_all`, and the change also
+recovered the merged matmul: 2.14 ms to 1.70 ms at N=64, with GEMM N=256 at 28.34 ms.
+
 ### Testing notes
 
 - The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
