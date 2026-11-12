@@ -601,6 +601,49 @@ definition that overwrites the previous one.
 The conv kernel returns to 10392 B / 1273 instructions / 15 `rep_all`, and the change also
 recovered the merged matmul: 2.14 ms to 1.70 ms at N=64, with GEMM N=256 at 28.34 ms.
 
+### Nondeterministic miscompile in scalar-local grouping (2026-11-13)
+
+The convolution benchmark failed roughly one run in five with **every** output element
+wrong. It was not a race between host and GPU: the failing process ran a different binary
+(18304 B instead of 12024 B), and that binary was produced by about four compilations in
+thirty. Replaying the saved binaries was deterministic - the small one passed every time,
+the large one failed every time - so the run failure rate was the bad-compile rate.
+
+`groupScalarLocals()` packs scalar locals into SIMD elements. The element extraction was
+arithmetically correct, but the `xor.setf elem_num, k` mask that selects the element was
+inserted directly after the local's last read, which could be **between a comparison and
+its conditional consumers**. In the failing IR the flag register from `udiv.remainder` was
+overwritten before `udiv.quotient`'s conditional select consumed it, so the selects read
+`elem_num == 4`; the loop-bound comparison, the `continue` conditions and the accumulator
+updates all followed it, leaving `sum == 0` for all 16384 work-group iterations. The store
+addresses, output pointer and uniforms were correct throughout.
+
+Separately, compilation was **nondeterministic**: pointer-ordered container iteration
+changed LICM hoist order, which changed register pressure, which changed which fixup ran.
+Under `setarch -R` the compiler was already bit-for-bit reproducible, so every variation
+came from memory addresses.
+
+Both are fixed:
+
+- Iteration order in `groupScalarLocals()`, `reserveGroupSpace()`, `moveLoopInvariantCode()`,
+  `reorderBasicBlocks()`, `GraphColoring` and the `LocalUtilization` tie-break now follows a
+  stable key (`Local::id`, or a block's position in the method) instead of pointers.
+- `flagsAreLive()` / `findFlagsDeadPosition()` move the element insertion behind readers of
+  the flags, or decline to group the local when that is not possible.
+- `verifyElementInsertions()` runs on every grouped compile and throws rather than emitting
+  code if an insertion is not preceded by its own `elem_num == k` mask, if the mask element
+  differs, if any instruction between the insertion and the next flag setter reads flags, if
+  a write to a group vector is not an element insertion, or if a read is not an
+  insert/copy/rotation/phi.
+
+Evidence: `conv64.cl` compiled 50 times yields one size and one md5 (`186fa62272a9caa249
+af527601ff4f97`, 12120 B); a 25-source sweep that previously differed on 20 of 25 now
+differs on 0 of 25; `dnnbench conv` 20/20 pass; installed-path conv 10/10. No measured
+regression: convclamp 174.6 ms, matmul 64 1.72 ms, GEMM N=256 28.8 ms.
+
+Note for anyone measuring on this port: because the compiler used to be nondeterministic,
+a single passing run was never evidence of correctness. Per-run checks are mandatory.
+
 ### Testing notes
 
 - The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
