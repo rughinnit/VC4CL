@@ -644,6 +644,36 @@ regression: convclamp 174.6 ms, matmul 64 1.72 ms, GEMM N=256 28.8 ms.
 Note for anyone measuring on this port: because the compiler used to be nondeterministic,
 a single passing run was never evidence of correctness. Per-run checks are mandatory.
 
+### Missing register delay after grouped scalar TMU reads (2026-11-13)
+
+`gemm_r8` (eight row accumulators) returned wrong values at N=96 - 479 of 9216 outputs,
+whole rows, values around 1e11-1e15 carrying pointer-like bits - while `gemm_vec4a` at the
+same shape was correct. It reproduced at merge factor 1 and even with a single work-group on
+a single QPU, so it had nothing to do with splitting or scheduling.
+
+`GroupTMUAccess` merged the eight scalar A-row loads into one `<8 x f32>` TMU read and
+lowered the seven extractions to full-range vector rotations (`v8min rd, ra, ra << N
+(full)`). Only five registers can act as accumulators (`r0`-`r3`, `r5`), so the allocator
+placed rotated values in register files A/B, and a read there one instruction after the
+write returns the *previous* value. The delay insertion relied on `isLocallyLimited()`
+("this will surely be an accumulator"), which the final allocation invalidated, so the
+required delay was never inserted.
+
+Confirmed by `-O1`/`-O0` passing while `-O2`/`-O3` fail, and by disabling only
+`--fno-group-memory`, which leaves zero full rotations and zero mismatches.
+
+No more than six scalar TMU reads are combined now (`MAX_GROUPED_SCALAR_TMU_READS`), which
+keeps enough accumulators available for the rotation path; `vload4`-style vector groups
+keep the optimisation. The cost is confined to the affected kernel: `gemm_r8` at N=96 goes
+from 1.05 ms (wrong) to 1.66 ms (correct), and the N=64/128/256 binaries are bit-identical
+to before.
+
+The underlying hole is larger than this cap. Nothing requires a delay *after* a rotation,
+and nothing re-checks delays against the final register mapping. A post-allocation
+`insertMissingRegisterDelays()` pass was written and measured: it fixes seven accumulators
+but not eight, so the hazard model needs finishing before the eight-element grouping can be
+restored. The cap is the correct choice until then.
+
 ### Testing notes
 
 - The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
