@@ -644,35 +644,62 @@ regression: convclamp 174.6 ms, matmul 64 1.72 ms, GEMM N=256 28.8 ms.
 Note for anyone measuring on this port: because the compiler used to be nondeterministic,
 a single passing run was never evidence of correctness. Per-run checks are mandatory.
 
-### Missing register delay after grouped scalar TMU reads (2026-11-13)
+### Grouped scalar TMU reads: unresolved miscompile, capped at six (2026-11-13)
 
 `gemm_r8` (eight row accumulators) returned wrong values at N=96 - 479 of 9216 outputs,
-whole rows, values around 1e11-1e15 carrying pointer-like bits - while `gemm_vec4a` at the
-same shape was correct. It reproduced at merge factor 1 and even with a single work-group on
-a single QPU, so it had nothing to do with splitting or scheduling.
+whole rows, values around 1e11-1e15 with pointer-like bits - while `gemm_vec4a` at the same
+shape was correct. It reproduced at merge factor 1 and with one work-group on a single QPU,
+so splitting and scheduling were not involved.
 
-`GroupTMUAccess` merged the eight scalar A-row loads into one `<8 x f32>` TMU read and
-lowered the seven extractions to full-range vector rotations (`v8min rd, ra, ra << N
-(full)`). Only five registers can act as accumulators (`r0`-`r3`, `r5`), so the allocator
-placed rotated values in register files A/B, and a read there one instruction after the
-write returns the *previous* value. The delay insertion relied on `isLocallyLimited()`
-("this will surely be an accumulator"), which the final allocation invalidated, so the
-required delay was never inserted.
+The common path is `GroupTMUAccess`: it merges eight scalar A-row loads into one
+`<8 x f32>` TMU read and lowers the seven extractions to full-range vector rotations
+(`v8min rd, ra, ra << N (full)`). Capping the merge at six scalar reads makes every case
+correct, which confines the defect to the eight-element form.
 
-Confirmed by `-O1`/`-O0` passing while `-O2`/`-O3` fail, and by disabling only
-`--fno-group-memory`, which leaves zero full rotations and zero mismatches.
+**The cause is not established, and the first diagnosis was wrong.** It was initially
+attributed to a missing register delay: only `r0`-`r3` and `r5` can be accumulators, and if
+rotated values land in register files A/B a read one instruction after the write returns
+the previous value. That explanation does not survive testing. With a complete
+post-allocation delay model in place (see below) the failure persists; inserting a delay
+instruction in front of *every* instruction of the kernel changes nothing; raising each
+individual rule in turn (rotation result, rotation source, all GP write-reads, rotation
+write-after-write) fixes none of it; and the QPU emulator computes the same binary
+correctly. The emitted sequence is semantically right and behaves wrongly on hardware, and
+no rule in the AG100-R accounts for it. Treat this as an undocumented register-file hazard
+of the `full` rotation form.
 
-No more than six scalar TMU reads are combined now (`MAX_GROUPED_SCALAR_TMU_READS`), which
-keeps enough accumulators available for the rotation path; `vload4`-style vector groups
-keep the optimisation. The cost is confined to the affected kernel: `gemm_r8` at N=96 goes
-from 1.05 ms (wrong) to 1.66 ms (correct), and the N=64/128/256 binaries are bit-identical
-to before.
+`MAX_GROUPED_SCALAR_TMU_READS = 6` therefore remains, and `vload4`-style vector groups keep
+the optimisation. The cost is confined to the affected kernel: `gemm_r8` at N=96 runs at
+1.66 ms instead of 1.05 ms. The N=64/128/256 binaries are bit-identical to before.
 
-The underlying hole is larger than this cap. Nothing requires a delay *after* a rotation,
-and nothing re-checks delays against the final register mapping. A post-allocation
-`insertMissingRegisterDelays()` pass was written and measured: it fixes seven accumulators
-but not eight, so the hazard model needs finishing before the eight-element grouping can be
-restored. The cap is the correct choice until then.
+### Register delays checked after the register mapping (2026-11-13)
+
+Delay insertion ran before allocation, using heuristics such as `isLocallyLimited()` ("this
+will surely be an accumulator"), and nothing re-checked the result against the real register
+files. `src/optimization/RegisterDelays.{h,cpp}` now carries the timing model as data with a
+manual citation per row - GP write to read 2 (p18), accumulator 1 (p18), packed write 2
+(p17), rotation source 2 (p37), unpacking read 2 (p17), `r4` after a load signal 1
+(p19/p24), SFU to `r4` 3 (p23), uniform pointer to read 3 (p22), TMU_NOSWAP to TMU write 3
+(p37), VPM setup to data 1 (p56, where VC4C relies on the documented stall), branch 4 (p20).
+A rule for reading a rotation *result* is deliberately absent: p37's restriction list
+contains none, and `gemm_v16` performs that pattern 60 times correctly.
+
+The pass applies the model after the register-mapping and peephole passes, where every
+operand's physical file is known, and a verifier then re-decodes the final instruction words
+and throws `CompilationError` - naming the register, the classes, the actual and required
+distance, and the citation - if any write-read pair is too close. Injecting a defect (a
+stricter model with insertion disabled) makes every kernel abort with that diagnostic; with
+the shipped model it rejects nothing, agreeing with the hardware that the corpus is clean.
+
+Applying the model only after allocation cost 29% on `gemm_v16`, because nothing could fill
+the slots. Teaching the pre-allocation machinery the same rule lets the scheduler fill them,
+and the cost is now unmeasurable: matmul 64 at 1.72 ms, `gemm_vec4a` at 1.228 ms, convclamp
+at 174.7 ms.
+
+The verifier does not subsume the grouping verifier from the previous section: that one
+checks SIMD-element and flag structure before register mapping and does not run at all for
+kernels that produced no element insertions, while this one checks instruction distances
+after mapping. Both stay.
 
 ### Testing notes
 
