@@ -701,6 +701,46 @@ checks SIMD-element and flag structure before register mapping and does not run 
 kernels that produced no element insertions, while this one checks instruction distances
 after mapping. Both stay.
 
+### Where GEMM time actually goes (2026-11-13)
+
+Kernel-level data reuse was expected to be the remaining large lever, on the reasoning that
+py-videocore's class reaches about 64 MACs per TMU request while these kernels reach far
+fewer. Measured with static instrumentation from the emitted assembly, that premise is
+incomplete:
+
+| kernel | instructions per k step | MACs per k step | TMU requests | MACs per request | ms at N=128 |
+|---|---|---|---|---|---|
+| `gemm_v4` | 154 | 16 | 5 | 3.20 | 3.807 |
+| `gemm_v8` | 275 | 32 | 6 | 5.33 | 3.07 |
+| `gemm_v16` | 517 | 64 | 8 | **8.00** | 2.848 |
+| 4x4 tile, blocked | 292 | 64 | 5 | **12.80** | 24.2 (unmerged) |
+
+Removing **all** loads from `gemm_v16` makes it 3.4x faster while the instruction count falls
+3.4x, so the kernel is **instruction-throughput bound**, not TMU bound. Of 517 loop
+instructions only 128 are MACs: 176 are register moves, 69 cross-lane rotations and 111
+address selects. That is why raising MACs per request does not pay by itself: the 4x4 tile
+would be 1.77x cheaper per MAC and 1.6x better on requests, but the merge gate rejects it
+(`step 16 bytes, element 4 bytes`) and unmerged it runs one work-item per QPU, landing at
+24.2 ms. Staging the B tile through `__local` memory is worse still (1096 instructions per k
+step, 35.8 ms): the compiler's grouped read already performs the cooperative load, and a
+16-work-item work-group costs 7x on its own. Stores through the hardware mutex account for
+0.31-0.44 ms of 2.85 ms, so they are not the lever either.
+
+What does pay is **launch geometry**. A power-of-two grid uses only 8 of the 12 QPUs.
+Padding the row-block grid and guarding the stores with a bounds check gives all 12:
+
+| N | kernel | grid | local | ms | GFLOP/s | versus before |
+|---|---|---|---|---|---|---|
+| 96 | `r16k4_96` | already 12 QPUs | — | 0.9592 | 1.8448 | unchanged |
+| 128 | `r16g_128` | 128x9 | 64x3 | 2.3409 | 1.7918 | **1.22x** |
+| 256 | `r16g_256` | 256x18 | 64x3 | 16.9171 | 1.9835 | **1.27x** |
+
+All verified element by element against a double-precision oracle over 10 consecutive
+launches. A control using 12 QPUs with the original 8 work-groups is 5% slower, which pins
+the gain on the group count rather than on the pad itself. The idiom is available to any
+kernel: launch extra row-blocks and guard the store, since the runtime cannot pad a grid on
+the kernel's behalf.
+
 ### Testing notes
 
 - The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
