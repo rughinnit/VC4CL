@@ -741,6 +741,50 @@ the gain on the group count rather than on the pad itself. The idiom is availabl
 kernel: launch extra row-blocks and guard the store, since the runtime cannot pad a grid on
 the kernel's behalf.
 
+### Failing closed when the allocator cannot place a local (2026-11-13)
+
+VC4C logged `Error allocating local to register` and emitted code anyway. Measured on the
+kernels that trigger it, those builds computed wrong values - but not all of them: some
+kernels logging the message were correct, and nine different fix-up subsets produced the
+identical wrong output, so the wrongness was deterministic rather than random. The earlier
+"4 of 4 wrong" was a small sample and is recorded here as such.
+
+The leftover state is not a stale or arbitrary mapping: a local that is live with locals
+fixed to **both** register file A and file B loses both, lands in the error set with
+`possibleFiles = NONE`, and `getRegisterFixed()` would throw. Code was emitted because
+`generateInstructions()` treats an uncolorable graph as an intermediate state - the
+`FIXUP_STEPS` rewrites insert copies before every use, group scalars, spill to VPM and
+rematerialise constants - and the rewritten program is recolored, so only the *rewritten*
+program was ever checked for colorability. With the fix-up steps disabled the same sources
+already failed with `There are erroneous register-associations`.
+
+Copying a vector or pointer local into a temporary is now refused before anything is
+modified: vectors are materialised through element-insert rotations and pointers are uniform
+values, so that copy is not a plain register move. Scalar copies continue to work. The
+diagnostic names the local, its type, the function, the interference degree and the free
+registers per file, for example:
+
+```
+local '%mul9', type <16 x i32>, in function 'gemm_r16k8_128': live at the same time as 636
+other locals, still free: 0 accumulator(s), 0 register(s) in file A, 4 register(s) in file B
+```
+
+An independent check now re-derives the final mapping against a fresh interference graph, and
+the give-up path of `toRegisterMap()` names the offending locals.
+
+Four kernels that previously built and computed wrong values now fail with
+`CL_BUILD_PROGRAM_FAILURE`: `r16k8_128`, `r16k8_256`, `t44_128`, `r24k4_96` and `lb_128`.
+In some configurations 21 further sources that previously built are refused as well. That is
+a real capability regression, accepted deliberately: a compiler that refuses a program is
+usable, one that emits a known-wrong binary is not. Four builds still log the message and
+are kept, because their repair is a plain scalar copy and they are verified correct -
+`conv64`, `convgroup`, `convclamp` and one diagnostic kernel.
+
+The proper fix is a real spill/free-and-retry for these locals; `spillLocals()` exists but its
+thresholds never select them, and the underlying miscompile of inserted copy/rotation
+instructions inside loops remains open, though it is now unreachable for vector and pointer
+locals.
+
 ### Testing notes
 
 - The ICD file points at `/usr/local/lib/libVC4CL.so`, so installing is required
