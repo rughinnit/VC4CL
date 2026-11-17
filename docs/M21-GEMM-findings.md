@@ -230,7 +230,47 @@ Persistence: `/etc/systemd/system/vc4-clock.service` (oneshot, after
 clocks at the next boot. 550 MHz V3D produced wrong results and 525/600 hung the
 GPU, so 500 is the cap used.
 
-## 12. Bottom line
+## 12. Compiler-level headroom (investigated 2026-11-18)
+
+The 64-bit QPU word carries one add-ALU and one mul-ALU operation, and VC4C models
+both (`ALUInstruction::Addition`/`Multiplication`). Measurements on `v16` (merged,
+12 QPUs):
+
+| build | loop body | packed words in loop | TMU |
+|---|---|---|---|
+| `-O0` | 1055 | 0 | 20 |
+| `-O2` (runtime default) | **517** | **0** | 8 |
+| `-O3` | allocator refuses (`rc=6`) | - | - |
+| `-O3 --fno-schedule-instructions` | 517 (identical to `-O2`) | 0 | 8 |
+
+- `-O3` adds only `schedule-instructions`; that pass is what pushes the allocator
+  over the edge, so the scheduling that would create packable pairs cannot run.
+- A post-register-mapping combiner already exists (`combineRegisterMappedOperations`,
+  `Peephole.h:44`) but only merges **adjacent** instructions. The loop is a dependent
+  chain (`fmul acc`, delay `or`, `fadd acc`), so the pair that could co-issue is never
+  adjacent.
+- Pass-toggle sweep at `-O2`: no `--fno-*` flag reduces the 517 words; `reorder` is
+  essential (674 words without it), everything else is neutral.
+- `-O3` shape sweep: the best alternative (8 rows, k-block 4) compiles but reaches
+  9.00 instr/MAC and 5.33 MACs/TMU, both worse than `v16` (8.08 / 8.00).
+
+Conclusion: the remaining headroom is in codegen, not in flags or kernel shapes. The
+two bounded options are (a) a windowed post-RA packer reusing `MERGE_CONDITIONS` and
+safe swaps (cannot change register assignments), or (b) a lookahead bound on
+`schedule-instructions` so it produces the packing order inside the register budget.
+
+### Final measured ceiling (500 MHz V3D / 550 MHz core)
+
+| N | kernel | best ms | GFLOP/s | result |
+|---|---|---|---|---|
+| 64 | `v16` | 0.3340 | 1.570 | PASS |
+| 96 | `v16` | 0.6366 | 2.780 | PASS |
+| 128 | `r16g_128`, padded | 1.5386 | 2.726 | PASS |
+| 256 | `r16g_256`, padded | 10.8891 | 3.082 | PASS |
+
+10 reps each, zero mismatches; 63.4 C; `get_throttled=0x0`.
+
+## 13. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
 - Best correct VC4 GEMM at stock clocks: `v16` + 12-QPU padding, 1.79-1.98 GFLOP/s.
@@ -238,8 +278,11 @@ GPU, so 500 is the cap used.
   **2.73 GFLOP/s at N=128 and 3.09 GFLOP/s at N=256**, verified end to end,
   which is above the original ~2.6 target. Clock scaling is linear and is the
   largest single lever found.
-- Further gains at fixed clock require the lane-block store feature (section 6),
-  which would stack on top of the clock gain.
+- Measured ceiling at the stable clock: 2.73 GFLOP/s (N=128), 3.08 (N=256), 2.78 (N=96).
+- At fixed clock the remaining headroom is codegen: the k-loop uses 517 words with
+  zero add+mul packing, `-O3` cannot allocate, and the post-RA combiner only merges
+  adjacent instructions (section 13). A windowed post-RA packer or a bounded
+  scheduler is the next step; kernel shapes and compiler flags are exhausted.
 - The only remaining route to ~2.6 GFLOP/s is the lane-block store feature. The gate is
   open and merging works; the work left is the multi-row VPM normalizer change plus
   vertical DMA selection, followed by an on-hardware A/B.
