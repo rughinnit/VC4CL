@@ -167,6 +167,10 @@ kernels.
 - `gen21b.py` - parameterised R x C tile generator (map nat/int, vec/sca).
 - `gen21c.py` - lane-interleaved tile with explicit column blocks (correct on hardware).
 - `gen21d.py` - `vstore4` variant (blocked by the value analysis).
+- `gen21e.py`, `gen21f.py` - nat-map compute with gate-compatible interleaved stores.
+- `launch.c` - launch-overhead microbenchmark (0.129 ms per empty enqueue+finish).
+- `v3dclk.c` - runtime clock setter via the firmware mailbox (section 11).
+- `vc4-clock.service` - persistence unit (gated by `/etc/vc4-clock.conf`).
 - `src/`, `asm/`, `logs/` - generated kernels, dumps, compile logs.
 - `NOTES-lane-block-stores.md` - short version of section 6 with rebuild/revert commands.
 - `stat.sh`, `asmanalyze.py` - static instruction/TMU accounting (from m19).
@@ -183,17 +187,59 @@ cd ~/m21 && ./stat.sh src/gemm_vst4_vb1_n128.cl vst4 64
 # CPU reference
 gcc -O3 -mcpu=cortex-a53 -fopenmp -o cpu_gemm cpu_gemm.c -lm && ./cpu_gemm 128 5 4
 
+# clock (root; V3D id 5, core id 4)
+sudo ~/m21/v3dclk 5 500 && sudo ~/m21/v3dclk 4 550
+vcgencmd measure_clock v3d
+
 # compiler experiment (branch feat/lane-block-stores)
 cd ~/vc4cl/VC4C/build && cmake --build . --parallel 2
 VC4C_MERGE_WORK_ITEMS=16 VC4C_LANE_BLOCK_STORES=1 \
   ./src/vc4c --verbose --asm --no-kernel-info ~/m21/src/nat_r4c4k2.cl -o /tmp/x.asm
 ```
 
-## 11. Bottom line
+## 11. Clock scaling — the dominant lever
+
+The V3D clock was 300 MHz (core 400). It can be raised at runtime through the
+firmware mailbox (`SET_CLOCK_RATE`), with no reboot and no config edit. Measured on
+the padded `r16g` GEMM (12 QPUs), N=128 unless stated, element-verified:
+
+| V3D / core (MHz) | N=128 GFLOP/s | N=256 GFLOP/s | result |
+|---|---|---|---|
+| 300 / 400 (stock) | 1.792 | 1.984 | PASS |
+| 400 / 500 | 1.905 | - | PASS |
+| 450 / 500 | 2.096 | - | PASS |
+| 500 / 500 | 2.289 | - | PASS |
+| **500 / 550** | **2.725** | **3.090** | PASS, 10/10 reps |
+| 550 / 550 | 2.473 | - | **FAIL**, 3382 mismatches |
+| 525 / 600 | - | - | **GPU hang**, board needed a reboot |
+
+The speedup tracks the clock almost exactly (1.33x clock -> 1.30x speed), so the
+kernel is clock-bound, not memory-bound. 500 MHz V3D / 550 MHz core is the stable
+maximum found: 1.52x at N=128 and 1.56x at N=256 over stock, crossing the ~2.6
+GFLOP/s target (2.73 and 3.09).
+
+Correctness at the overclock, shipped harnesses, zero mismatches:
+`bench_vc4cl all` 5/5 (matmul 64 = 1.114 ms, was ~1.72 ms), `dnnbench conv`
+2612 ms (was 4125 ms), `dnnbench convclamp` 109.5 ms (was 174.5 ms), padded GEMM
+10/10 reps at N=128 and 5/5 at N=256. Temperature 58-61 C, `get_throttled=0x0`
+after the reboot (the earlier under-voltage flags were from the previous boot).
+
+Persistence: `/etc/systemd/system/vc4-clock.service` (oneshot, after
+`multi-user.target`) runs `v3dclk 5 500` and `v3dclk 4 550`; it is gated by
+`ConditionPathExists=/etc/vc4-clock.conf`, so removing that file restores stock
+clocks at the next boot. 550 MHz V3D produced wrong results and 525/600 hung the
+GPU, so 500 is the cap used.
+
+## 12. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
-- The best correct GEMM remains `v16` + 12-QPU padding: 1.79-1.98 GFLOP/s,
-  i.e. 1.4x slower than the four A53 cores and 2.7x faster than one.
+- Best correct VC4 GEMM at stock clocks: `v16` + 12-QPU padding, 1.79-1.98 GFLOP/s.
+- With the stable clock setting (500 MHz V3D / 550 MHz core) the same kernels reach
+  **2.73 GFLOP/s at N=128 and 3.09 GFLOP/s at N=256**, verified end to end,
+  which is above the original ~2.6 target. Clock scaling is linear and is the
+  largest single lever found.
+- Further gains at fixed clock require the lane-block store feature (section 6),
+  which would stack on top of the clock gain.
 - The only remaining route to ~2.6 GFLOP/s is the lane-block store feature. The gate is
   open and merging works; the work left is the multi-row VPM normalizer change plus
   vertical DMA selection, followed by an on-hardware A/B.

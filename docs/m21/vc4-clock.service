@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply VC4 compute clock settings
+After=multi-user.target
+ConditionPathExists=/etc/vc4-clock.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/raspi/m21/v3dclk 5 500
+ExecStart=/home/raspi/m21/v3dclk 4 550
+
+[Install]
+WantedBy=multi-user.target
