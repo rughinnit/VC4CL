@@ -307,7 +307,41 @@ Remaining opening from B: give the product its own accumulator so `fmul->fadd`
 distance drops to 1, collapsing a 5-word group to 4 (517 -> ~453, ~12 %). That is
 a pre-register-allocation change, not a peephole.
 
-## 16. Bottom line
+## 16. Product-accumulator allocation (accepted)
+
+Change: bias the allocation of a multiply result that has a single ADD-ALU use
+within 4 slots into an accumulator (r0-r3), and delete the copy that used to
+materialize the product. `fmul->fadd` distance drops from 2 to 1, the group goes
+from 5 words to 4. It is a preference only: on failure the graph is recoloured
+without it, so compilability never regresses.
+
+| metric | before | after |
+|---|---|---|
+| v16 k-loop words | 517 | **453** (-12.4%) |
+| slots / nops | 526 / 13 | 462 / 9 |
+| `or` slots | 176 | 116 |
+| whole kernel words | 1056 | 992 |
+| corpus (129 kernels) | - | 50 smaller, 0 bigger, 0 compile regressions |
+
+GPU, stock clocks (300/400), one job at a time, zero mismatches:
+
+| N | before | after | gain |
+|---|---|---|---|
+| 96 | 1.845 | **2.169** | +17.6% |
+| 128 (padded) | 1.792 | **2.061** | +15.0% |
+| 256 (padded) | 1.984 | **2.311** | +16.5% |
+
+`bench_vc4cl all` 5/5. Branch `perf/product-acc` (c32d3d8).
+
+Note: literal packed `fadd ...; fmul ...` words remain impossible - a word has one
+`raddr_a` and one `raddr_b`, `fmul` reads `rep` (file B) and `fadd` reads the
+running sum (file A). The 12.4% comes from deleting the copy, not from packing it.
+
+Idle-board CPU reference for comparison (4x A53, `-O3 -fopenmp`): 2.632 / 2.681 /
+2.724 GFLOP/s at N=96/128/256. The patched VC4 at stock clocks is therefore 0.77-0.85x
+the four cores; at the 500 MHz setting (currently off) it would be ~1.3-1.4x.
+
+## 17. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
 - Best correct VC4 GEMM at stock clocks: `v16` + 12-QPU padding, 1.79-1.98 GFLOP/s.
