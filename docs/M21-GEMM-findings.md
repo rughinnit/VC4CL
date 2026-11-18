@@ -468,6 +468,28 @@ not help: `VC4C_PIPELINE_LOADS=4` moves the (b) pops to 11/160/159/155 and gains
 moved further without crossing the loop back edge - i.e. cross-iteration
 pipelining with a prologue/epilogue, the next structural step.
 
+## 19. Gather-base default and cross-iteration prefetch (2026-11-18)
+
+- **Gather base out of the fixed r5: accepted as default, with allocation fallback.**
+  When a gather base is a single address for all lanes it is no longer broadcast
+  through `r5`; if that makes a kernel unallocatable, the compiler recompiles once
+  without the preference, byte-identical to forcing it off. +1.1-1.2% at N=128/256,
+  80/80 corpus kernels compile, 0 regressions, bench 5/5.
+- **Cross-iteration prefetch: implemented, correct, rejected.** It rotates the first
+  request plus its address chain into the preheader with a clamped last value (the
+  unguarded version produced 22k-163k mismatches, proving the guard is required),
+  and extends the first pop window 3x - but wall time does not move (N=96 2.564 ->
+  2.528, N=128 2.640 -> 2.619, N=256 3.053 -> 3.033). It also disproves the earlier
+  attribution: the first a-gather pop is not the residual limiter. Kept off by
+  default (`VC4C_PIPELINE_ACROSS`) to document the experiment.
+
+Accepted stack at this point, stock clocks, 0 mismatches, bench_vc4cl 5/5:
+
+| N | 2.565 | 2.668 | 3.085 GFLOP/s |
+|---|---|---|---|
+
+Branch `perf/pipeline4` (5e5ace5, parent dfb5b45).
+
 ## 19. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
