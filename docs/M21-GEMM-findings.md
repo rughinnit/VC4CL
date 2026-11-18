@@ -490,6 +490,55 @@ Accepted stack at this point, stock clocks, 0 mismatches, bench_vc4cl 5/5:
 
 Branch `perf/pipeline4` (5e5ace5, parent dfb5b45).
 
+## 20. Hand-written GEMM and the four measured ceilings
+
+Final hand-written result (stock clocks, overclock disabled, every element checked
+against a double-precision oracle, 6/6 clean runs per size):
+
+| N | A panel | GEMM | total | GFLOP/s total | compiled (same clocks) | ratio |
+|---|---|---|---|---|---|---|
+| 128 | 0.063 ms | 0.464 ms | 0.527 ms | **7.97** | 2.668 | 2.99x |
+| 256 | 0.356 ms | 3.183 ms | 3.539 ms | **9.48** | 3.085 | 3.07x |
+
+GEMM-only rates are 9.05 / 10.55 GFLOP/s; the panel costs 10-12%.
+
+Three fixes made it work:
+1. VPM->DRAM store: the VDW setup needs DEPTH=4 (`0x80845A00`); the old
+   `0x80815A00` encoded DEPTH=1 and a 1-word DMA never completes, which is why
+   `vpw_wait` wedged every earlier attempt.
+2. The 12-QPU race: one instruction word both wrote a `tmuNs` address register and
+   carried a pop signal, substituting an A vector for one k-term. Separating the two
+   costs zero instructions (2/5 -> 6/6 clean).
+3. Coalesced A panel: `A[(rb*N+k)*16+r]` built once per GEMM with a VDR load and a
+   vertical VDW transpose, so each request is one 64 B line instead of 16.
+
+### The four configurations (not levels of a ladder, different workloads)
+
+All percentages are against the same structural peak, 28.8 GFLOP/s at 300 MHz
+(12 QPUs x 16 lanes x 2 ALU ops x 1/4 instruction per clock).
+
+| configuration | does | includes | excludes | GFLOP/s | % peak |
+|---|---|---|---|---|---|
+| ALU-only microbenchmark | packed fmul+fadd on registers, 12 QPUs | pure arithmetic | no memory at all | 28.36 | 98.5% |
+| synthetic memory-fed loop | same arithmetic + one coalesced TMU read/iteration, both TMUs 2-deep | arithmetic + operand loads | no stores, no layout problem, no verified result | 16.42 | 57% |
+| hand-written GEMM | real GEMM: packed A panel, B loads, 16x16 tile, VPM->DMA stores, verified | everything, panel cost included | nothing | 9.48 | 33% |
+| compiled path (stacked changes) | VC4C-generated v16 | everything, compiler-scheduled | nothing | 3.09 | 10.7% |
+
+The gaps decompose cleanly: 28.36 -> 16.42 is the cost of touching memory;
+16.42 -> 9.48 is the cost of a real GEMM's broadcasts, address work and stores;
+9.48 -> 3.09 is the compiler's stalls and shuffles.
+
+### Where the remaining headroom is
+
+The hand-written loop runs at 86-92% of its 156-cycle/k issue floor, so memory is no
+longer the limit; the loop issues 39 words per k, of which 16 are packed MAC words and
+16 are broadcast pairs (rotate + replicate) for the lane-uniform A row. A wider
+register tile (e.g. 4 columns per lane) amortises each broadcast over 4 MACs and is the
+model-based path toward the 16-18 GFLOP/s band. The compiler cannot express that tile
+(value width, store layout, allocator); a hand schedule can.
+
+The overclock (verified +52-56%) is disabled and is not part of any number above.
+
 ## 19. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
