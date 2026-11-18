@@ -369,7 +369,106 @@ was a runner artifact: with the correct environment N=256 is clean both on and o
 Idle CPU reference: 2.632 / 2.681 / 2.724. At stock clocks the VC4 now reaches
 0.95x / 0.96x / 0.85x of the four A53 cores.
 
-## 18. Bottom line
+## 18. Pipelining refinements and the N=256 "no gain" (accepted)
+
+Branch `perf/pipeline3` (dfb5b45, parent 2720dae), clone `/home/raspi/work/pipe3`.
+
+### Why N=256 looked flat
+
+The pass is applied to `r16g_256` exactly like to `r16g_128`: same decision log
+(`Pipelined the TMU loads of loop body '%for.body': 8 requests, at most 2 in flight per TMU`),
+same 456-word loop body, same request->pop distances (TMU0 78/141/167/129,
+TMU1 7/10/8/42), same 4 + 4 requests over both TMUs. Loop selection, trip count
+(64 > 1) and TMU counts are therefore all fine, and latency is *more* of a limiter
+at N=256, not less:
+
+| | issue floor | measured | stall |
+|---|---|---|---|
+| N=128, pass on | 1.17 ms | 1.55 ms | 0.38 ms |
+| N=256, pass on | 9.34 ms | 11.15 ms | 1.96 ms |
+| N=256, pass off | 9.34 ms | 14.52 ms | 5.18 ms |
+
+(issue floor = k-loop words x 4 clocks x iterations / 300 MHz; `EXECUTION_CYCLES`
+counts issuing cycles only, so the difference to the wall time is stall.)
+
+The old datapoint (2.311 -> 2.312, "0 mismatches") cannot be reproduced with any
+command of the accepted tree: with `GEMM19_PADY=18`, local 64x3 and
+`VC4C_PIPELINE_LOADS=2` the same kernel runs 14.52 -> 11.29 ms (2.311 -> 2.973
+GFLOP/s) on `pipe2`, reproducible over repeated A/B pairs. Two mechanisms produce
+exactly the observed "flat + 0 mismatches + unchanged word count":
+
+- a run without the patched library or without the forwarded variable: the stock
+  runner (`m21/run21.sh`, `m19/run19.sh`) puts the installed VC4C first on
+  `LD_LIBRARY_PATH` and does not forward `VC4C_PIPELINE_LOADS` at all - that gives
+  1.79 / 1.98 GFLOP/s, i.e. the pre-product-acc code, and
+- the pass's own fail-closed revert: when a block fails validation the pass keeps
+  the original order, which is indistinguishable from "off" in the timings and
+  cannot produce a mismatch. The pass logs that at DEBUG level, the acceptance run
+  did not capture the log.
+
+Whatever it was, the "no gain at N=256" column is stale: N=256 has the largest
+gain of the three shapes.
+
+### Refinement (a): a pop may cross flag setters
+
+The compare chain that builds the per-lane byte offsets of a gather
+(`or.setf`/`xor.setf` + `or.ifz`/`ldi.ifz`, up to 32 instructions per request) is a
+side effect, and `canMovePopAcross()` rejected every side effect, so the pops of
+the scalar (b) loads stopped 8 and 42 instructions behind their requests although
+their values are first used ~130 instructions later. A pop is a pure read of its
+TMU's receive FIFO, it never reads the flags, and it stays directly in front of its
+read of r4, so it may cross them; the flag source of every conditional and the
+reaching definition of every value the pop and its r4 read use are still verified
+after every single move, and the whole block is validated again at the end.
+
+    TMU1 request->pop:  7 10  8 42   ->   7 10 118 114
+    TMU0 request->pop: 78 141 167 129 -> 78 141 167 129  (unchanged)
+
+### Refinement (b): a single gather base out of the fixed r5 (opt-in)
+
+The base address of a gather is broadcast through the fixed per-quad register r5.
+r5 is also the register the vector rotations use to extract single vector elements
+and the MACs read it every few instructions, so a request that must move together
+with its r5 fill can never cross a MAC block and therefore cannot be issued a
+section earlier. When the base is one single address for all lanes
+(`isSingleBaseAddress()`: a pointer, and not the pointer-per-lane encoding) the
+broadcast is unnecessary; `VC4C_PIPELINE_GATHER_BASE=1` lets the address
+calculation read it directly. The k-loop shrinks from 457 to 452 words and the r5
+fills from 68 to 64 per iteration.
+
+It is not on by default: the base then occupies one general-purpose register in
+file A for its live range, and the largest kernels of the corpus are exactly at the
+register limit (0 free A registers, 6 free B), so `r16k8_96`, `r16k8_128`,
+`r16k8_256`, `r16gc_128` and `r20k4_120` become unallocatable ("repairing it would
+copy a vector or pointer local into a temporary register"). Default stays
+fail-closed with (a) only; the switch is +1% where it fits.
+
+### GPU, stock clocks (300/400), 0 mismatches, `STATE: LIVE` after every run
+
+| N | off | pass on (a) | + gather base (a+b) |
+|---|---|---|---|
+| 96 (local 32x6) | 2.172 | **2.566** | 2.575 |
+| 128 (pady 9, local 64x3) | 2.072 | **2.644** | 2.677 |
+| 256 (pady 18, local 64x3) | 2.313 | **3.053** | 3.085 |
+
+GFLOP/s, 10 reps, best of run, two rounds. Against accepted `perf/pipeline2`
+(2.518 / 2.591 / 2.973): +1.9% / +2.0% / +2.7% for (a) and +2.3% / +3.3% / +3.8%
+for (a+b). Against the product-accumulator baseline: +18.1% / +27.6% / +32.0% for
+(a), +18.6% / +29.2% / +33.4% for (a+b). `gemm_v16` N=128 unpadded: 1.687 -> 2.099
+(+24.4%, was 1.996 on `perf/pipeline2`). `bench_vc4cl all` 5/5 with the pass off,
+with (a) and with (a+b), including matmul N=32/64 (0.40/1.69 ms).
+
+Corpus sweep (80 kernels that `perf/pipeline2` could compile), default settings:
+0 compilation regressions, 75 reordered, 5 identical, word-count delta at most +1
+(delay-slot bundling), 2 kernels one word smaller.
+
+Remaining residual at N=256 is 1.96 ms out of 11.0 ms (18%). Deeper TMU queues do
+not help: `VC4C_PIPELINE_LOADS=4` moves the (b) pops to 11/160/159/155 and gains
+0.7%. What is left is the first a-gather pop of each iteration, which cannot be
+moved further without crossing the loop back edge - i.e. cross-iteration
+pipelining with a prologue/epilogue, the next structural step.
+
+## 19. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
 - Best correct VC4 GEMM at stock clocks: `v16` + 12-QPU padding, 1.79-1.98 GFLOP/s.
