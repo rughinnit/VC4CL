@@ -270,7 +270,44 @@ safe swaps (cannot change register assignments), or (b) a lookahead bound on
 
 10 reps each, zero mismatches; 63.4 C; `get_throttled=0x0`.
 
-## 13. Bottom line
+## 14. Measured hardware ceiling (hand-written QPU code, 2026-11-18)
+
+Correction to earlier sections: the QPU retires **one instruction per 4 clocks**
+(confirmed twice, by the V3D cycle counter and wall clock, at 1k and 1M loop
+iterations). The structural peak is therefore
+
+```
+12 QPUs x 16 lanes x 2 ALU ops x 1/4 instr/clock x 300 MHz = 28.8 GFLOP/s
+```
+
+not the 192 GFLOP/s that assumes 1 instruction/clock. At 500 MHz the peak is 48.
+
+- Hand-written 12-QPU packed mul+add loop (register operands, deep unroll):
+  **28.36 GFLOP/s = 98.5 % of the structural peak**, with perfect 12x scaling.
+- Same loop with one TMU request per iteration, 2-deep pipelined: **0.32 GFLOP/s**.
+  The cycle counter is identical to the no-memory run, so the loss is `load_tmu0`
+  stall time: latency-bound, not bandwidth-bound (~129 MB/s in flight).
+- Compiled GEMM at 500 MHz is 3.08 GFLOP/s = **6.4 % of the 48 GFLOP/s peak** and
+  ~9.6 % of the mix-limited bound (124 mul-slot vs 380 add-slot ops per iteration
+  cap it at 1.33 ops/slot ~ 66 % of peak). ~90 % of the gap is stalls.
+- Open item: VPM->DRAM readback in the hand-written harness never completed (one
+  attempt wedged `vpw_wait`), so those numbers rest on instruction counts plus the
+  independent cycle counter, not on reading QPU output.
+
+## 15. Compiler tracks (2026-11-18)
+
+| track | outcome |
+|---|---|
+| A allocator spill/free-and-retry | **accepted**: 122 -> 130 kernels compile, 8 previously refused now correct, 0 regressions, all 122 prior kernels byte-identical, v16 unchanged (2.93 ms / 1.43 GFLOP/s, 0 mismatch), bench_vc4cl 5/5. Branch `perf/spill-retry` (bda5bc6). |
+| B windowed post-RA packer | rejected: correct but unencodable. One `raddr_a` per word means `fadd` and `fmul` (both file-A readers) can never share a word; the only encodable pair (`fmul` + `or r0,rb0,rb0`) trades 1:1 with a delay NOP (517 words before and after). Loop is add-ALU bound (380 add vs 124 mul ops) and delay-tight. |
+| C software pipelining | rejected: registered before `group-memory`, so it sees 16 pre-group requests, exceeds the 4-deep FIFO and is inert on the GEMM; where it fires it hoists a request past the instruction that fills its address register -> bench_vc4cl 3/5 with thousands of mismatches. |
+| D hand-written QPU ceiling | 28.36 GFLOP/s ALU-only (98.5 % of peak); 0.32 GFLOP/s with a 2-deep memory pipeline. |
+
+Remaining opening from B: give the product its own accumulator so `fmul->fadd`
+distance drops to 1, collapsing a 5-word group to 4 (517 -> ~453, ~12 %). That is
+a pre-register-allocation change, not a peephole.
+
+## 16. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
 - Best correct VC4 GEMM at stock clocks: `v16` + 12-QPU padding, 1.79-1.98 GFLOP/s.
@@ -278,7 +315,10 @@ safe swaps (cannot change register assignments), or (b) a lookahead bound on
   **2.73 GFLOP/s at N=128 and 3.09 GFLOP/s at N=256**, verified end to end,
   which is above the original ~2.6 target. Clock scaling is linear and is the
   largest single lever found.
-- Measured ceiling at the stable clock: 2.73 GFLOP/s (N=128), 3.08 (N=256), 2.78 (N=96).
+- Measured hardware peak is 28.8 GFLOP/s at 300 MHz (one instruction per 4 clocks);
+  at 500 MHz the compiled GEMM reached 2.73 (N=128) / 3.08 (N=256), ~6.4 % of peak.
+- Hand-written QPU code reaches 98.5 % of peak with register-only operands, but only
+  0.32 GFLOP/s with a shallow memory pipeline - latency, not bandwidth, is the wall.
 - At fixed clock the remaining headroom is codegen: the k-loop uses 517 words with
   zero add+mul packing, `-O3` cannot allocate, and the post-RA combiner only merges
   adjacent instructions (section 13). A windowed post-RA packer or a bounded
