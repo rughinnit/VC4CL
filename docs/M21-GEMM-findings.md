@@ -341,7 +341,35 @@ Idle-board CPU reference for comparison (4x A53, `-O3 -fopenmp`): 2.632 / 2.681 
 2.724 GFLOP/s at N=96/128/256. The patched VC4 at stock clocks is therefore 0.77-0.85x
 the four cores; at the 500 MHz setting (currently off) it would be ~1.3-1.4x.
 
-## 17. Bottom line
+## 17. Corrected TMU pipelining (accepted)
+
+Registered after `lower-memory-access` and `group-memory` (the previous attempt ran
+before grouping and was inert). Uses both TMU0 and TMU1, at most 2 requests in
+flight per TMU, moves each request together with the address-calculation slice that
+produces it, keeps issue and pop order, verifies reaching definitions of locals and
+fixed registers plus flags, and reverts the whole block if any invariant fails.
+Off by default: `VC4C_PIPELINE_LOADS=1..4`.
+
+Static: k-loop stays 453 words (pure re-order). Request->pop distances change from
+1,1,1,1 (TMU0) and 2,2,2,3 (TMU1) to 78,141,167,129 and 7,10,8,42, with max 2 in
+flight per TMU.
+
+GPU, stock clocks, 0 mismatches everywhere:
+
+| N | off | on | gain |
+|---|---|---|---|
+| 96 | 2.170 | **2.506** | +15.5% |
+| 128 padded | 2.070 | **2.579** | +24.6% |
+| 256 padded | 2.311 | 2.312 | none |
+
+`bench_vc4cl all` 5/5, including matmul N=32/64 (the cases the first attempt broke).
+Branch `perf/pipeline2` (2720dae, parent c32d3d8). An earlier N=256 mismatch report
+was a runner artifact: with the correct environment N=256 is clean both on and off.
+
+Idle CPU reference: 2.632 / 2.681 / 2.724. At stock clocks the VC4 now reaches
+0.95x / 0.96x / 0.85x of the four A53 cores.
+
+## 18. Bottom line
 
 - The M21 workaround is dead: measured 1.106 GFLOP/s vs 1.466 for `v16`.
 - Best correct VC4 GEMM at stock clocks: `v16` + 12-QPU padding, 1.79-1.98 GFLOP/s.
