@@ -1,0 +1,17 @@
+# Default Build folder
+build/
+
+#Eclipse
+.cproject
+.project
+.csettings/
+.settings/
+
+# Netbeans
+dist/
+nbproject/
+
+# Other
+lib/
+testResult.log
+testing/
