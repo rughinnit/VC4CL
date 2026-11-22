@@ -1,0 +1,24 @@
+target_sources(VC4CL
+  PRIVATE
+    barriers.cpp
+    Buffer.cpp
+    CommandQueue.cpp
+    common.cpp
+    Context.cpp
+    Device.cpp
+    Event.cpp
+    executor.cpp
+    extensions.cpp
+    icd_loader.cpp
+    Image.cpp
+    Kernel.cpp
+    Memory.cpp
+    ObjectTracker.cpp
+    PerformanceCounter.cpp
+    Platform.cpp
+    Program.cpp
+    queue_handler.cpp
+    TextureFormat.cpp
+    unsupported.cpp
+    shared/BinaryHeader.cpp
+)
