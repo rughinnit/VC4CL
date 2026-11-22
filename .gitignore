@@ -1,0 +1,20 @@
+# Default Build folder
+build/
+
+# Build folder for the ICD-enabled library
+build-icd/
+
+#Eclipse
+.cproject
+.project
+.csettings/
+.settings/
+
+# Netbeans
+dist/
+nbproject/
+
+# Other
+lib/
+testResult.log
+testing/
